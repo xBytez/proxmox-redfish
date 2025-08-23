@@ -108,23 +108,23 @@ This guide will take you from a fresh Proxmox installation to a fully working Re
    # Create the configuration file
    cat > /opt/proxmox-redfish/config/params.env << 'EOF'
    # Proxmox Configuration
-   export PROXMOX_HOST="$(hostname -I | awk '{print $1}')"
-   export PROXMOX_USER="root@pam"
-   export PROXMOX_PASSWORD="your-proxmox-root-password"
-   export PROXMOX_API_PORT="8006"
-   export PROXMOX_NODE="$(hostname)"
-   export PROXMOX_ISO_STORAGE="local"
+   PROXMOX_HOST="$(hostname -I | awk '{print $1}')"
+   PROXMOX_USER="root@pam"
+   PROXMOX_PASSWORD="your-proxmox-root-password"
+   PROXMOX_API_PORT="8006"
+   PROXMOX_NODE="$(hostname)"
+   PROXMOX_ISO_STORAGE="local"
 
    # SSL Configuration
-   export SSL_CERT_FILE="/opt/proxmox-redfish/config/ssl/server.crt"
-   export SSL_KEY_FILE="/opt/proxmox-redfish/config/ssl/server.key"
+   SSL_CERT_FILE="/opt/proxmox-redfish/config/ssl/server.crt"
+   SSL_KEY_FILE="/opt/proxmox-redfish/config/ssl/server.key"
 
    # Logging Configuration
-   export REDFISH_LOG_LEVEL="INFO"
-   export REDFISH_LOGGING_ENABLED="true"
+   REDFISH_LOG_LEVEL="INFO"
+   REDFISH_LOGGING_ENABLED="true"
 
    # SSL Verification (for Proxmox API)
-   export VERIFY_SSL="false"
+   VERIFY_SSL="false"
    EOF
    ```
    **Important**: Replace `your-proxmox-root-password` with your actual Proxmox root password.
@@ -190,8 +190,8 @@ For production use, create a dedicated user instead of using root:
    vi /opt/proxmox-redfish/config/params.env
    
    # Change these lines:
-   export PROXMOX_USER="redfish@pam"
-   export PROXMOX_PASSWORD="your-redfish-user-password"
+   PROXMOX_USER="redfish@pam"
+   PROXMOX_PASSWORD="your-redfish-user-password"
    ```
 
 3. Restart the service
