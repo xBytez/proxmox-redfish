@@ -16,10 +16,10 @@ The daemon can be configured using environment variables. Here are all available
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROXMOX_HOST` | `pve-node-hostname` | Proxmox hostname or IP address |
+| `PROXMOX_HOST` | `pve-node-hostname` | Proxmox hostname, API VIP, or comma-separated host list |
 | `PROXMOX_USER` | `username` | Proxmox username (i.e., `root@pam`) |
 | `PROXMOX_PASSWORD` | `password` | Proxmox password or API token |
-| `PROXMOX_NODE` | `pve-node-name` | Proxmox node name |
+| `PROXMOX_NODE` | empty | Optional fallback node if cluster-wide VM lookup is unavailable |
 | `PROXMOX_ISO_STORAGE` | `local` | Proxmox storage name used for ISO uploads; it must support `iso` content |
 | `VERIFY_SSL` | `false` | Verify SSL certificates for Proxmox API |
 
@@ -59,7 +59,7 @@ cat > /opt/proxmox-redfish/config/params.env << 'EOF'
 export PROXMOX_HOST="192.168.1.100"
 export PROXMOX_USER="redfish@pam"
 export PROXMOX_PASSWORD="your-secure-password"
-export PROXMOX_NODE="pve"
+export PROXMOX_NODE=""
 export PROXMOX_ISO_STORAGE="local"
 export VERIFY_SSL="false"
 
@@ -78,6 +78,7 @@ export REDFISH_LOGGING_ENABLED="true"
 EOF
 ```
 
+`PROXMOX_HOST` can point at any reachable Proxmox cluster node, an API VIP, or a comma-separated list of hosts for simple failover. `PROXMOX_NODE` is optional and is only used as a fallback if the daemon cannot resolve a VM's current node from the cluster API.
 `PROXMOX_ISO_STORAGE` must reference a Proxmox storage that supports `iso` content. The daemon uploads ISOs through the Proxmox API, so it does not need the storage mounted locally.
 
 ### JSON Configuration File
@@ -91,7 +92,7 @@ cat > /opt/proxmox-redfish/config/config.json << 'EOF'
     "host": "192.168.1.100",
     "user": "redfish@pam",
     "password": "your-secure-password",
-    "node": "pve",
+    "node": "",
     "iso_storage": "local",
     "verify_ssl": false
   },
@@ -234,7 +235,7 @@ This project is still very new, so things can change over time, but this is how 
    export PROXMOX_HOST="192.168.1.100"
    export PROXMOX_USER="redfish-api@pam"
    export PROXMOX_PASSWORD="your-api-token-here"
-   export PROXMOX_NODE="pve"
+   export PROXMOX_NODE=""
    export PROXMOX_ISO_STORAGE="local"
    export VERIFY_SSL="false"
 

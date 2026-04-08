@@ -113,7 +113,7 @@ This guide will take you from a fresh install to a working Redfish API daemon. T
    PROXMOX_USER="root@pam"
    PROXMOX_PASSWORD="your-proxmox-root-password"
    PROXMOX_API_PORT="8006"
-   PROXMOX_NODE="YOUR-PROXMOX-NODE-NAME"
+   PROXMOX_NODE=""
    PROXMOX_ISO_STORAGE="local"
 
    # SSL Configuration
@@ -128,7 +128,8 @@ This guide will take you from a fresh install to a working Redfish API daemon. T
    VERIFY_SSL="false"
    EOF
    ```
-   **Important**: Replace the placeholder values with your real Proxmox API host, node name, and credentials.
+   **Important**: Replace the placeholder values with your real Proxmox API host and credentials.
+   `PROXMOX_HOST` can be any reachable Proxmox cluster node, an API VIP, or a comma-separated list of cluster API hosts for simple failover. `PROXMOX_NODE` is optional and is only used as a fallback if cluster-wide VM lookup is unavailable.
    `PROXMOX_ISO_STORAGE` must point to a Proxmox storage that allows `iso` content; the daemon uploads through the Proxmox API and does not need direct access to `/var/lib/vz`.
 
 7. Create a systemd service unit (so we can run the proxmox-redfish daemon as a service)

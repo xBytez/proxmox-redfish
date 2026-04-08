@@ -89,6 +89,10 @@ class TestRedfishProxmox(unittest.TestCase):
 
         # Mock VM list
         mock_proxmox.nodes.return_value.qemu.get.return_value = self.mock_vm_list
+        mock_proxmox.cluster.resources.get.return_value = [
+            {"type": "qemu", "vmid": 100, "node": "pve-node", "name": "test-vm-1", "status": "running"},
+            {"type": "qemu", "vmid": 101, "node": "pve-node-2", "name": "test-vm-2", "status": "stopped"},
+        ]
 
         # Mock VM status
         mock_proxmox.nodes.return_value.qemu.return_value.status.current.get.return_value = self.mock_vm_status
@@ -508,6 +512,7 @@ class TestMetal3Compatibility(unittest.TestCase):
     def test_metal3_boot_source_override(self):
         """Test Metal3 boot source override functionality"""
         mock_proxmox = Mock()
+        mock_proxmox.cluster.resources.get.return_value = [{"type": "qemu", "vmid": 100, "node": "pve-node"}]
         mock_proxmox.nodes.return_value.qemu.return_value.config.get.return_value = {
             "boot": "order=scsi0;ide2;net0",
             "ide2": "none,media=cdrom",
@@ -526,6 +531,7 @@ class TestMetal3Compatibility(unittest.TestCase):
     def test_metal3_power_states(self):
         """Test Metal3 power state compatibility"""
         mock_proxmox = Mock()
+        mock_proxmox.cluster.resources.get.return_value = [{"type": "qemu", "vmid": 100, "node": "pve-node"}]
         mock_proxmox.nodes.return_value.qemu.return_value.status.current.get.return_value = {"status": "running"}
         mock_proxmox.nodes.return_value.qemu.return_value.config.get.return_value = {
             "name": "test-vm",

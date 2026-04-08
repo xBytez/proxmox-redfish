@@ -72,7 +72,7 @@ else:
 PROXMOX_HOST = os.getenv("PROXMOX_HOST", "pve-node-hostname")
 PROXMOX_USER = os.getenv("PROXMOX_USER", "username")
 PROXMOX_PASSWORD = os.getenv("PROXMOX_PASSWORD", "password")
-PROXMOX_NODE = os.getenv("PROXMOX_NODE", "pve=-node-name")
+PROXMOX_NODE = os.getenv("PROXMOX_NODE", "").strip()
 PROXMOX_API_PORT = os.getenv("PROXMOX_API_PORT", "8006")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() == "true"
 # ISO storage configuration - specifies the Proxmox storage used for ISO uploads
@@ -178,15 +178,27 @@ def get_proxmox_api(headers: Any) -> ProxmoxAPI:
 
     # Always use the root session for Proxmox operations
     # The user authentication is handled in validate_token
+    last_error = None
+    for host in [entry.strip() for entry in PROXMOX_HOST.split(",") if entry.strip()]:
+        try:
+            proxmox = ProxmoxAPI(
+                host,
+                user=PROXMOX_USER,
+                password=PROXMOX_PASSWORD,
+                verify_ssl=VERIFY_SSL,
+                timeout=1800,  # 30 minutes timeout for large uploads
+            )
+            proxmox.version.get()
+            return proxmox
+        except Exception as e:
+            last_error = e
+            logger.warning("Failed to connect to Proxmox API host %s: %s", host, str(e))
+
+    if not PROXMOX_HOST.strip():
+        raise Exception("Failed to connect to Proxmox API: PROXMOX_HOST is empty")
+
     try:
-        proxmox = ProxmoxAPI(
-            PROXMOX_HOST,
-            user=PROXMOX_USER,
-            password=PROXMOX_PASSWORD,
-            verify_ssl=VERIFY_SSL,
-            timeout=1800,  # 30 minutes timeout for large uploads
-        )
-        return proxmox
+        raise Exception(f"Failed to connect to Proxmox API: {str(last_error)}")
     except Exception as e:
         raise Exception(f"Failed to connect to Proxmox API: {str(e)}")
 
@@ -288,40 +300,38 @@ def authenticate_user(username: str, password: str) -> bool:
         bool: True if authentication successful, False otherwise
     """
     try:
+        hosts = [entry.strip() for entry in PROXMOX_HOST.split(",") if entry.strip()]
+        if not hosts:
+            logger.warning("Authentication failed: PROXMOX_HOST is empty")
+            return False
+
         # Check if this looks like an API token (contains '!' and is a UUID-like string)
         if "!" in username and len(password) == 36 and password.count("-") == 4:
             # This is an API token - use Authorization header format
             token_header = f"PVEAPIToken={username}={password}"
-            url = f"https://{PROXMOX_HOST}:{PROXMOX_API_PORT}/api2/json/version"
-
-            # Test the token by making a simple API call
-            response = requests.get(url, headers={"Authorization": token_header}, verify=VERIFY_SSL, timeout=10)
-
-            if response.status_code == 200:
-                logger.info(f"API token authentication successful for {username}")
-                return True
-            else:
-                logger.warning(f"API token authentication failed for {username}: HTTP {response.status_code}")
-                return False
+            for host in hosts:
+                url = f"https://{host}:{PROXMOX_API_PORT}/api2/json/version"
+                response = requests.get(url, headers={"Authorization": token_header}, verify=VERIFY_SSL, timeout=10)
+                if response.status_code == 200:
+                    logger.info(f"API token authentication successful for {username} via {host}")
+                    return True
+                logger.warning(f"API token authentication failed for {username} via {host}: HTTP {response.status_code}")
+            return False
         else:
             # This is a regular username/password - use the ticket endpoint
             payload = {"username": username, "password": password}
-            url = f"https://{PROXMOX_HOST}:{PROXMOX_API_PORT}/api2/json/access/ticket"
-
-            # Make the request to authenticate the user
-            response = requests.post(url, data=payload, verify=VERIFY_SSL, timeout=10)
-
-            if response.status_code == 200:
-                data = response.json()
-                if "data" in data and "ticket" in data["data"]:
-                    logger.info(f"User {username} authenticated successfully")
-                    return True
+            for host in hosts:
+                url = f"https://{host}:{PROXMOX_API_PORT}/api2/json/access/ticket"
+                response = requests.post(url, data=payload, verify=VERIFY_SSL, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if "data" in data and "ticket" in data["data"]:
+                        logger.info(f"User {username} authenticated successfully via {host}")
+                        return True
+                    logger.warning(f"User {username} authentication failed via {host}: no ticket in response")
                 else:
-                    logger.warning(f"User {username} authentication failed: no ticket in response")
-                    return False
-            else:
-                logger.warning(f"User {username} authentication failed: HTTP {response.status_code}")
-                return False
+                    logger.warning(f"User {username} authentication failed via {host}: HTTP {response.status_code}")
+            return False
 
     except Exception as e:
         logger.warning(f"User {username} authentication failed with exception: {str(e)}")
@@ -339,11 +349,73 @@ def get_file_lock(filename: str) -> threading.Lock:
         return iso_file_locks[filename]
 
 
-def _wait_for_task_completion(proxmox: ProxmoxAPI, task_id: str, poll_interval: int = 2) -> None:
+def _list_cluster_vm_resources(proxmox: ProxmoxAPI) -> list[Dict[str, Any]]:
+    """List cluster-wide VM resources and keep only QEMU entries."""
+    resources_api = proxmox.cluster.resources
+    try:
+        resources = resources_api.get(type="vm")
+    except Exception:
+        resources = resources_api.get()
+    if not isinstance(resources, list):
+        return []
+    return [resource for resource in resources if resource.get("type") == "qemu"]
+
+
+def _get_vm_node(proxmox: ProxmoxAPI, vm_id: Union[str, int]) -> str:
+    """Resolve the current node for a VM from cluster resources."""
+    vmid = int(vm_id)
+    for resource in _list_cluster_vm_resources(proxmox):
+        if resource.get("vmid") == vmid:
+            node_name = resource.get("node")
+            if node_name:
+                return str(node_name)
+
+    if PROXMOX_NODE:
+        logger.warning("Falling back to PROXMOX_NODE=%s for VM %s", PROXMOX_NODE, vmid)
+        return PROXMOX_NODE
+
+    raise ValueError(f"Unable to determine Proxmox node for VM {vmid}")
+
+
+def _get_vm_resource(proxmox: ProxmoxAPI, vm_id: Union[str, int]) -> Any:
+    """Return the proxmoxer resource for a VM on its current node."""
+    return proxmox.nodes(_get_vm_node(proxmox, vm_id)).qemu(vm_id)
+
+
+def _get_storage_node(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> str:
+    """Return the node to use for storage operations."""
+    if node_name:
+        return node_name
+    if PROXMOX_NODE:
+        return PROXMOX_NODE
+    return _get_default_node(proxmox)
+
+
+def _get_default_node(proxmox: ProxmoxAPI) -> str:
+    """Resolve a default cluster node when no VM-specific node is available."""
+    try:
+        nodes = proxmox.nodes.get()
+        if isinstance(nodes, list):
+            for node in nodes:
+                node_name = node.get("node")
+                if node_name:
+                    return str(node_name)
+    except Exception:
+        pass
+
+    for resource in _list_cluster_vm_resources(proxmox):
+        node_name = resource.get("node")
+        if node_name:
+            return str(node_name)
+
+    raise ValueError("PROXMOX_NODE is required only as a fallback when no VM node is available")
+
+
+def _wait_for_task_completion(proxmox: ProxmoxAPI, task_id: str, node_name: str, poll_interval: int = 2) -> None:
     """Wait for a Proxmox task to finish successfully."""
     logger.info("Waiting for task completion: %s", task_id)
     while True:
-        status = proxmox.nodes(PROXMOX_NODE).tasks(task_id).status.get()
+        status = proxmox.nodes(node_name).tasks(task_id).status.get()
         if status is None:
             raise Exception(f"Failed to get task status for {task_id}")
         if status.get("status") == "stopped":
@@ -354,9 +426,9 @@ def _wait_for_task_completion(proxmox: ProxmoxAPI, task_id: str, poll_interval: 
         time.sleep(poll_interval)
 
 
-def _get_storage_details(proxmox: ProxmoxAPI) -> Dict[str, Any]:
+def _get_storage_details(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> Dict[str, Any]:
     """Fetch metadata for the configured ISO storage."""
-    storage_info = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).get()
+    storage_info = proxmox.nodes(_get_storage_node(proxmox, node_name)).storage(PROXMOX_ISO_STORAGE).get()
     if isinstance(storage_info, dict):
         return storage_info
     return {}
@@ -372,9 +444,9 @@ def _storage_supports_iso(storage_info: Dict[str, Any]) -> bool:
     return False
 
 
-def _list_iso_storage_content(proxmox: ProxmoxAPI) -> list[Dict[str, Any]]:
+def _list_iso_storage_content(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> list[Dict[str, Any]]:
     """List ISO content entries on the configured storage."""
-    content_api = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).content
+    content_api = proxmox.nodes(_get_storage_node(proxmox, node_name)).storage(PROXMOX_ISO_STORAGE).content
     try:
         entries = content_api.get(content="iso")
     except Exception:
@@ -410,9 +482,9 @@ def _download_iso_to_file(url: str, target_path: str) -> Tuple[str, int]:
     return checksum.hexdigest(), size
 
 
-def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str) -> None:
+def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str, node_name: str) -> None:
     """Upload an ISO file to the configured Proxmox storage via API."""
-    upload_api = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).upload
+    upload_api = proxmox.nodes(node_name).storage(PROXMOX_ISO_STORAGE).upload
     with open(file_path, "rb") as iso_file:
         try:
             task_id = upload_api.post(content="iso", filename=iso_file)
@@ -420,7 +492,7 @@ def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str) -> None:
             iso_file.seek(0)
             task_id = upload_api.post(content="iso", filename=os.path.basename(file_path), file=iso_file)
 
-    _wait_for_task_completion(proxmox, task_id)
+    _wait_for_task_completion(proxmox, task_id, node_name)
 
 
 def atomic_file_write(temp_file_path: str, target_path: str, timeout: int = 300) -> None:
@@ -479,7 +551,7 @@ def safe_file_hash(file_path: str, timeout: int = 60) -> Optional[str]:
 def power_on(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     logger.info("Power On request for VM %s", vm_id)
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.start.post()
+        task = _get_vm_resource(proxmox, vm_id).status.start.post()
         logger.info("Power On initiated for VM %s, task: %s", vm_id, task)
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
@@ -497,7 +569,7 @@ def power_on(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 def power_off(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.shutdown.post()
+        task = _get_vm_resource(proxmox, vm_id).status.shutdown.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -513,7 +585,7 @@ def power_off(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 def reboot(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.reboot.post()
+        task = _get_vm_resource(proxmox, vm_id).status.reboot.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -539,7 +611,7 @@ def reset_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
         Tuple of (response_dict, status_code) for Redfish response
     """
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.reset.post()
+        task = _get_vm_resource(proxmox, vm_id).status.reset.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -555,7 +627,7 @@ def reset_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 def suspend_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.suspend.post()
+        task = _get_vm_resource(proxmox, vm_id).status.suspend.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -571,7 +643,7 @@ def suspend_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 def resume_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.resume.post()
+        task = _get_vm_resource(proxmox, vm_id).status.resume.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -587,7 +659,7 @@ def resume_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 def stop_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.stop.post()
+        task = _get_vm_resource(proxmox, vm_id).status.stop.post()
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -602,7 +674,7 @@ def stop_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
 
 
 # This section allows OpenShift ZTP to autoload a generated ISO
-def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str) -> str:
+def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str, node_name: Optional[str] = None) -> str:
     """
     Return a storage:iso/… volid, downloading + uploading if needed.
     Supports HTTP/S URLs and local storage references.
@@ -631,7 +703,8 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str) -> str:
         if not fname.endswith(".iso"):
             fname += ".iso"  # Ensure .iso extension
 
-        storage_info = _get_storage_details(proxmox)
+        storage_node = _get_storage_node(proxmox, node_name)
+        storage_info = _get_storage_details(proxmox, storage_node)
         if storage_info and not _storage_supports_iso(storage_info):
             raise ValueError(f"Storage {PROXMOX_ISO_STORAGE} does not support ISO content")
 
@@ -640,7 +713,7 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str) -> str:
 
         with file_lock:
             logger.info("Acquired lock for ISO file: %s", fname)
-            entries = _list_iso_storage_content(proxmox)
+            entries = _list_iso_storage_content(proxmox, storage_node)
             existing_entry = _find_iso_entry(entries, fname)
 
             with tempfile.TemporaryDirectory(prefix="proxmox-redfish-iso-") as tmp_dir:
@@ -660,16 +733,16 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str) -> str:
                     os.replace(download_path, renamed_path)
                     download_path = renamed_path
 
-                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox), fname)
+                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox, storage_node), fname)
                     if existing_entry:
                         logger.info("Hash-suffixed ISO already present, reusing %s", existing_entry.get("volid"))
                         return existing_entry["volid"]
 
                 try:
                     logger.info("Uploading ISO to storage %s via Proxmox API", PROXMOX_ISO_STORAGE)
-                    _upload_iso_file(proxmox, download_path)
+                    _upload_iso_file(proxmox, download_path, storage_node)
                 except Exception as upload_error:
-                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox), fname)
+                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox, storage_node), fname)
                     if existing_entry:
                         logger.info("ISO became available during upload retry window, reusing %s", existing_entry.get("volid"))
                         return existing_entry["volid"]
@@ -703,7 +776,9 @@ def manage_virtual_media(
     logger.info("VirtualMedia operation: action=%s, vm_id=%s, iso_path=%s", action, vm_id, iso_path)
 
     try:
-        vm_config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config
+        vm_resource = _get_vm_resource(proxmox, vm_id)
+        vm_node = _get_vm_node(proxmox, vm_id)
+        vm_config = vm_resource.config
 
         if action == "InsertMedia":
             if not iso_path:
@@ -713,7 +788,7 @@ def manage_virtual_media(
                 }, 400
 
             logger.info("Processing InsertMedia for VM %s with ISO: %s", vm_id, iso_path)
-            iso_path = _ensure_iso_available(proxmox, iso_path)
+            iso_path = _ensure_iso_available(proxmox, iso_path, vm_node)
             logger.info("ISO prepared for VM %s: %s", vm_id, iso_path)
 
             config_data = {"ide2": f"{iso_path},media=cdrom"}
@@ -762,7 +837,7 @@ def manage_virtual_media(
 # Update VM config (unchanged)
 def update_vm_config(proxmox: ProxmoxAPI, vm_id: int, config_data: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     try:
-        task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.post(**config_data)
+        task = _get_vm_resource(proxmox, vm_id).config.post(**config_data)
         return {
             "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
             "@odata.type": "#Task.v1_0_0.Task",
@@ -782,7 +857,7 @@ def reorder_boot_order(proxmox: ProxmoxAPI, vm_id: int, current_order: str, targ
     Returns the new boot order string for Proxmox config.
     """
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             raise ValueError("Failed to retrieve VM configuration")
 
@@ -850,7 +925,7 @@ def reorder_boot_order(proxmox: ProxmoxAPI, vm_id: int, current_order: str, targ
 
 def get_bios(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error("BIOS retrieval", Exception("Failed to retrieve VM configuration"), vm_id)
         firmware_type = config.get("bios", "seabios")
@@ -877,7 +952,7 @@ def get_smbios_type1(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], T
     including firmware type (BIOS or UEFI).
     """
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error("SMBIOS retrieval", Exception("Failed to retrieve VM configuration"), vm_id)
         smbios1 = config.get("smbios1", "")
@@ -947,7 +1022,7 @@ def get_vm_config(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tupl
     Returns a subset of data for custom use, but prefer get_vm_status for Redfish compliance.
     """
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Configuration retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1001,7 +1076,7 @@ def validate_token(headers: Any) -> Tuple[bool, str]:
 
 def get_processor_collection(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Processor collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1023,7 +1098,7 @@ def get_processor_detail(
     proxmox: ProxmoxAPI, vm_id: int, processor_id: str
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Processor detail retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1102,7 +1177,7 @@ def get_storage_detail(
                 "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Storage {storage_id} not found"}
             }, 404
 
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Storage detail retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1139,7 +1214,7 @@ def get_drive_detail(
                 "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Storage {storage_id} not found"}
             }, 404
 
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Drive detail retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1173,7 +1248,7 @@ def get_volume_collection(
                 "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Storage {storage_id} not found"}
             }, 404
 
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Volume collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1208,7 +1283,7 @@ def get_controller_collection(
                 "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Storage {storage_id} not found"}
             }, 404
 
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Controller collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1240,7 +1315,7 @@ def get_ethernet_interface_collection(
     proxmox: ProxmoxAPI, vm_id: int
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Ethernet interface collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1269,7 +1344,7 @@ def get_ethernet_interface_detail(
     proxmox: ProxmoxAPI, vm_id: int, interface_id: str
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Ethernet interface detail retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1297,7 +1372,7 @@ def get_virtual_media(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], 
     Get virtual media information for a Proxmox VM.
     """
     try:
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error(
                 "Virtual media retrieval", Exception("Failed to retrieve VM configuration"), vm_id
@@ -1338,7 +1413,7 @@ def get_manager(proxmox: ProxmoxAPI, manager_id: int) -> Union[Dict[str, Any], T
         vm_id = manager_id
 
         # Get VM config to verify it exists
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = _get_vm_resource(proxmox, vm_id).config.get()
         if config is None:
             return handle_proxmox_error("Manager retrieval", Exception("Failed to retrieve VM configuration"), vm_id)
 
@@ -1358,11 +1433,12 @@ def get_manager(proxmox: ProxmoxAPI, manager_id: int) -> Union[Dict[str, Any], T
 
 def get_vm_status(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tuple[Dict[str, Any], int]]:
     try:
-        status = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.current.get()
+        vm_resource = _get_vm_resource(proxmox, vm_id)
+        status = vm_resource.status.current.get()
         if status is None:
             return handle_proxmox_error("VM status retrieval", Exception("Failed to retrieve VM status"), vm_id)
 
-        config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+        config = vm_resource.config.get()
         if config is None:
             return handle_proxmox_error("VM status retrieval", Exception("Failed to retrieve VM configuration"), vm_id)
 
@@ -1475,7 +1551,7 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                 parts = path.split("/")
                 if path == "/redfish/v1/Systems":
                     try:
-                        vm_list = proxmox.nodes(PROXMOX_NODE).qemu.get()
+                        vm_list = _list_cluster_vm_resources(proxmox)
                         members = [{"@odata.id": f"/redfish/v1/Systems/{vm['vmid']}"} for vm in vm_list]
                         response = {
                             "@odata.id": "/redfish/v1/Systems",
@@ -1655,7 +1731,17 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                 else:
                     if "@" not in username:
                         username += "@pam"
-                    proxmox = ProxmoxAPI(PROXMOX_HOST, user=username, password=password, verify_ssl=VERIFY_SSL)
+                    hosts = [entry.strip() for entry in PROXMOX_HOST.split(",") if entry.strip()]
+                    proxmox = None
+                    for host in hosts:
+                        try:
+                            proxmox = ProxmoxAPI(host, user=username, password=password, verify_ssl=VERIFY_SSL)
+                            proxmox.version.get()
+                            break
+                        except Exception:
+                            proxmox = None
+                    if proxmox is None:
+                        raise Exception("Failed to establish a Proxmox session on any configured host")
                     token = secrets.token_hex(16)
                     sessions[token] = {"username": username, "password": password, "created": time.time()}
                     status_code = 201
@@ -1883,7 +1969,7 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                                 }
                             else:
                                 bios_setting = "seabios" if mode == "BIOS" else "ovmf"
-                                task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(bios=bios_setting)
+                                task = _get_vm_resource(proxmox, vm_id).config.set(bios=bios_setting)
                                 response = {
                                     "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
                                     "@odata.type": "#Task.v1_0_0.Task",
@@ -1940,7 +2026,7 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                         else:
                             firmware_mode = mode_map[mode]
                             bios_setting = "seabios" if firmware_mode == "BIOS" else "ovmf"
-                            task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.set(bios=bios_setting)
+                            task = _get_vm_resource(proxmox, vm_id).config.set(bios=bios_setting)
                             response = {
                                 "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
                                 "@odata.type": "#Task.v1_0_0.Task",
@@ -2025,7 +2111,8 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                             # Check the VM's current power state
                             logger.debug(f"Checking power state for VM {vm_id}")
                             try:
-                                status = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).status.current.get()
+                                vm_resource = _get_vm_resource(proxmox, vm_id)
+                                status = vm_resource.status.current.get()
                                 logger.debug(f"VM {vm_id} status: {status['status']}")
                             except Exception as e:
                                 logger.error(f"Failed to get VM {vm_id} status: {str(e)}")
@@ -2048,13 +2135,13 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
                             # Proceed with boot order change
                             logger.debug(f"VM {vm_id}, proceeding with boot order change to {target}")
                             try:
-                                config = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.get()
+                                config = vm_resource.config.get()
                                 current_boot = config.get("boot", "")
                                 logger.debug(f"Current boot order: {current_boot}")
                                 new_boot_order = reorder_boot_order(proxmox, int(vm_id), current_boot, target)
                                 logger.debug(f"New boot order: {new_boot_order}")
                                 config_data = {"boot": f"order={new_boot_order}" if new_boot_order else ""}
-                                task = proxmox.nodes(PROXMOX_NODE).qemu(vm_id).config.post(**config_data)
+                                task = vm_resource.config.post(**config_data)
                                 logger.debug(f"Boot order update task initiated: {task}")
                                 response = {
                                     "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
