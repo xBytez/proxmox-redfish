@@ -75,15 +75,15 @@ PROXMOX_PASSWORD = os.getenv("PROXMOX_PASSWORD", "password")
 PROXMOX_NODE = os.getenv("PROXMOX_NODE", "pve=-node-name")
 PROXMOX_API_PORT = os.getenv("PROXMOX_API_PORT", "8006")
 VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() == "true"
-# ISO storage configuration - specifies the storage pool for ISO downloads
+# ISO storage configuration - specifies the Proxmox storage used for ISO uploads
 PROXMOX_ISO_STORAGE = os.getenv("PROXMOX_ISO_STORAGE", "local")
 # Legacy support for OCP_ZTP_AUTOLOAD (deprecated)
 AUTOLOAD = os.getenv("OCP_ZTP_AUTOLOAD", "false").lower() == "true" or PROXMOX_ISO_STORAGE != "none"
 
 # SSL certificate configuration
-SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", "/opt/redfish_daemon/config/ssl/server.crt")
-SSL_KEY_FILE = os.getenv("SSL_KEY_FILE", "/opt/redfish_daemon/config/ssl/server.key")
-SSL_CA_FILE = os.getenv("SSL_CA_FILE", "/opt/redfish_daemon/config/ssl/ca.crt")  # Optional CA bundle
+SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", "/opt/proxmox-redfish/config/ssl/server.crt")
+SSL_KEY_FILE = os.getenv("SSL_KEY_FILE", "/opt/proxmox-redfish/config/ssl/server.key")
+SSL_CA_FILE = os.getenv("SSL_CA_FILE", "/opt/proxmox-redfish/config/ssl/ca.crt")  # Optional CA bundle
 
 # Options
 # -A <Authn>, --Auth <Authn> -- Authentication type to use:  Authn={ None | Basic | Session (default) }
@@ -339,6 +339,90 @@ def get_file_lock(filename: str) -> threading.Lock:
         return iso_file_locks[filename]
 
 
+def _wait_for_task_completion(proxmox: ProxmoxAPI, task_id: str, poll_interval: int = 2) -> None:
+    """Wait for a Proxmox task to finish successfully."""
+    logger.info("Waiting for task completion: %s", task_id)
+    while True:
+        status = proxmox.nodes(PROXMOX_NODE).tasks(task_id).status.get()
+        if status is None:
+            raise Exception(f"Failed to get task status for {task_id}")
+        if status.get("status") == "stopped":
+            if status.get("exitstatus") == "OK":
+                logger.info("Task completed successfully: %s", task_id)
+                return
+            raise Exception(f"Task failed: {status}")
+        time.sleep(poll_interval)
+
+
+def _get_storage_details(proxmox: ProxmoxAPI) -> Dict[str, Any]:
+    """Fetch metadata for the configured ISO storage."""
+    storage_info = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).get()
+    if isinstance(storage_info, dict):
+        return storage_info
+    return {}
+
+
+def _storage_supports_iso(storage_info: Dict[str, Any]) -> bool:
+    """Check whether the configured storage advertises ISO content support."""
+    content_types = storage_info.get("content")
+    if isinstance(content_types, str):
+        return "iso" in {entry.strip() for entry in content_types.split(",")}
+    if isinstance(content_types, list):
+        return "iso" in content_types
+    return False
+
+
+def _list_iso_storage_content(proxmox: ProxmoxAPI) -> list[Dict[str, Any]]:
+    """List ISO content entries on the configured storage."""
+    content_api = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).content
+    try:
+        entries = content_api.get(content="iso")
+    except Exception:
+        entries = content_api.get()
+    return entries if isinstance(entries, list) else []
+
+
+def _find_iso_entry(entries: list[Dict[str, Any]], filename: str) -> Optional[Dict[str, Any]]:
+    """Locate an ISO entry by its filename on the configured storage."""
+    target_volid = f"{PROXMOX_ISO_STORAGE}:iso/{filename}"
+    for entry in entries:
+        if entry.get("volid") == target_volid:
+            return entry
+    return None
+
+
+def _download_iso_to_file(url: str, target_path: str) -> Tuple[str, int]:
+    """Download an ISO URL to a local temp file while computing its SHA-256."""
+    logger.info("Downloading ISO from URL: %s", url)
+    response = requests.get(url, stream=True, timeout=600, verify=VERIFY_SSL)
+    response.raise_for_status()
+
+    checksum = hashlib.sha256()
+    size = 0
+    with open(target_path, "wb") as handle:
+        for chunk in response.iter_content(16 << 20):
+            if not chunk:
+                continue
+            handle.write(chunk)
+            checksum.update(chunk)
+            size += len(chunk)
+
+    return checksum.hexdigest(), size
+
+
+def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str) -> None:
+    """Upload an ISO file to the configured Proxmox storage via API."""
+    upload_api = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).upload
+    with open(file_path, "rb") as iso_file:
+        try:
+            task_id = upload_api.post(content="iso", filename=iso_file)
+        except TypeError:
+            iso_file.seek(0)
+            task_id = upload_api.post(content="iso", filename=os.path.basename(file_path), file=iso_file)
+
+    _wait_for_task_completion(proxmox, task_id)
+
+
 def atomic_file_write(temp_file_path: str, target_path: str, timeout: int = 300) -> None:
     """
     Atomically write a file to prevent corruption during concurrent access.
@@ -547,127 +631,49 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str) -> str:
         if not fname.endswith(".iso"):
             fname += ".iso"  # Ensure .iso extension
 
-        # Determine storage path for hash checking
-        if PROXMOX_ISO_STORAGE == "local":
-            storage_path = "/var/lib/vz/template/iso"
-        else:
-            # Try to get storage path from Proxmox API
-            try:
-                storage_info = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).get()
-                if isinstance(storage_info, dict):
-                    storage_path = storage_info.get("path", "")
-                else:
-                    storage_path = ""
-            except Exception:
-                storage_path = ""
-
-        if not storage_path:
-            raise Exception(f"Could not determine storage path for {PROXMOX_ISO_STORAGE}")
+        storage_info = _get_storage_details(proxmox)
+        if storage_info and not _storage_supports_iso(storage_info):
+            raise ValueError(f"Storage {PROXMOX_ISO_STORAGE} does not support ISO content")
 
         # Get file-specific lock to prevent concurrent access to the same ISO
         file_lock = get_file_lock(fname)
 
         with file_lock:
             logger.info("Acquired lock for ISO file: %s", fname)
+            entries = _list_iso_storage_content(proxmox)
+            existing_entry = _find_iso_entry(entries, fname)
 
-            # Check if file already exists and compare hashes
-            iso_path = os.path.join(storage_path, fname)
-            if os.path.exists(iso_path):
-                logger.info("ISO file already exists: %s", iso_path)
+            with tempfile.TemporaryDirectory(prefix="proxmox-redfish-iso-") as tmp_dir:
+                download_path = os.path.join(tmp_dir, fname)
+                downloaded_hash_hex, downloaded_size = _download_iso_to_file(url_or_volid, download_path)
 
-                # Download to temp file to calculate hash
-                logger.info("Downloading ISO to calculate hash for comparison")
-                resp = requests.get(url_or_volid, stream=True, timeout=600, verify=VERIFY_SSL)
-                resp.raise_for_status()
+                if existing_entry:
+                    existing_size = existing_entry.get("size")
+                    if existing_size == downloaded_size:
+                        logger.info("ISO already present with matching size, reusing %s", existing_entry.get("volid"))
+                        return existing_entry["volid"]
 
-                with tempfile.NamedTemporaryFile() as tmp:
-                    for chunk in resp.iter_content(16 << 20):  # 16 MiB chunks
-                        tmp.write(chunk)
-                    tmp.flush()
+                    logger.info("Existing ISO name conflict detected, using hash suffix")
+                    name_without_ext, ext = os.path.splitext(fname)
+                    fname = f"{name_without_ext}_{downloaded_hash_hex[:8]}{ext}"
+                    renamed_path = os.path.join(tmp_dir, fname)
+                    os.replace(download_path, renamed_path)
+                    download_path = renamed_path
 
-                    # Calculate hash of downloaded file
-                    tmp.seek(0)
-                    downloaded_hash = hashlib.sha256()
-                    for chunk in iter(lambda: tmp.read(8192), b""):
-                        downloaded_hash.update(chunk)
-                    downloaded_hash_hex = downloaded_hash.hexdigest()
+                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox), fname)
+                    if existing_entry:
+                        logger.info("Hash-suffixed ISO already present, reusing %s", existing_entry.get("volid"))
+                        return existing_entry["volid"]
 
-                    # Safely calculate hash of existing file
-                    existing_hash_hex = safe_file_hash(iso_path)
-
-                    if existing_hash_hex:
-                        logger.info(
-                            "Hash comparison - Downloaded: %s, Existing: %s",
-                            downloaded_hash_hex[:16],
-                            existing_hash_hex[:16],
-                        )
-
-                        if downloaded_hash_hex == existing_hash_hex:
-                            logger.info("ISO files are identical, skipping upload")
-                            volid = f"{PROXMOX_ISO_STORAGE}:iso/{fname}"
-                            logger.info("ISO available as: %s", volid)
-                            return volid
-                        else:
-                            logger.info("ISO files differ, will upload with hash suffix")
-                            # Create filename with hash suffix to avoid conflicts
-                            name_without_ext = os.path.splitext(fname)[0]
-                            ext = os.path.splitext(fname)[1]
-                            fname = f"{name_without_ext}_{downloaded_hash_hex[:8]}{ext}"
-                            iso_path = os.path.join(storage_path, fname)
-                            logger.info("Using unique filename: %s", fname)
-                    else:
-                        logger.warning("Could not calculate hash of existing file, proceeding with upload")
-            else:
-                logger.info("ISO file does not exist, downloading: %s", fname)
-                # Download the ISO
-                resp = requests.get(url_or_volid, stream=True, timeout=600, verify=VERIFY_SSL)
-                resp.raise_for_status()
-
-                with tempfile.NamedTemporaryFile() as tmp:
-                    for chunk in resp.iter_content(16 << 20):  # 16 MiB chunks
-                        tmp.write(chunk)
-                    tmp.flush()
-
-                    # Try API upload first, fallback to direct file copy if it fails
-                    try:
-                        logger.info("Attempting API upload to storage %s", PROXMOX_ISO_STORAGE)
-                        upload = proxmox.nodes(PROXMOX_NODE).storage(PROXMOX_ISO_STORAGE).upload
-                        task = upload.post(content="iso", filename=fname, file=open(tmp.name, "rb"))
-
-                        # Wait for the upload task to finish
-                        logger.info("API upload task started: %s", task)
-                        while True:
-                            status = proxmox.nodes(PROXMOX_NODE).tasks(task).status.get()
-                            if status is None:
-                                raise Exception("Failed to get task status")
-                            if status.get("status") == "stopped":
-                                if status.get("exitstatus") == "OK":
-                                    logger.info("API upload completed successfully")
-                                    break
-                                else:
-                                    raise Exception(f"API upload failed: {status}")
-                            time.sleep(2)
-
-                    except Exception as api_error:
-                        logger.warning("API upload failed: %s, trying direct file copy", str(api_error))
-
-                        # Fallback: Direct file copy to storage directory with atomic write
-                        try:
-                            logger.info("Copying ISO to: %s", iso_path)
-
-                            # Ensure directory exists
-                            os.makedirs(os.path.dirname(iso_path), exist_ok=True)
-
-                            # Use atomic file write to prevent corruption
-                            atomic_file_write(tmp.name, iso_path)
-
-                            logger.info("Direct file copy completed successfully")
-
-                        except Exception as copy_error:
-                            raise Exception(
-                                f"Both API upload and direct copy failed. "
-                                f"API error: {api_error}, Copy error: {copy_error}"
-                            )
+                try:
+                    logger.info("Uploading ISO to storage %s via Proxmox API", PROXMOX_ISO_STORAGE)
+                    _upload_iso_file(proxmox, download_path)
+                except Exception as upload_error:
+                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox), fname)
+                    if existing_entry:
+                        logger.info("ISO became available during upload retry window, reusing %s", existing_entry.get("volid"))
+                        return existing_entry["volid"]
+                    raise Exception(f"API upload failed for {fname}: {upload_error}") from upload_error
 
             volid = f"{PROXMOX_ISO_STORAGE}:iso/{fname}"
             logger.info("ISO available as: %s", volid)

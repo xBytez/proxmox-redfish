@@ -24,7 +24,8 @@ A Redfish API daemon for managing Proxmox VMs, providing a standardized interfac
 ## Prerequisites
 
 - Proxmox VE 7.0 or higher
-- Root access to your Proxmox host
+- A Linux host or container with network access to the Proxmox API
+- Credentials with permission to manage the target VMs and upload ISOs to the selected Proxmox storage
 - Internet connection for downloading dependencies
 
 ## System Requirements
@@ -37,7 +38,7 @@ A Redfish API daemon for managing Proxmox VMs, providing a standardized interfac
 
 ## Quick Start Guide
 
-This guide will take you from a fresh Proxmox installation to a fully working Redfish API daemon, even if you're not extremely comfortable with the Proxmox host-level Linux CLI.
+This guide will take you from a fresh install to a working Redfish API daemon. The daemon can run on the Proxmox node or on a separate host, as long as it can reach the Proxmox API and the source ISO URLs you plan to use.
 
 
 ### Installation
@@ -50,10 +51,10 @@ This guide will take you from a fresh Proxmox installation to a fully working Re
 
 2. Navigate to **Datacenter** > **YOUR-HYPERVISOR-HOSTNAME** > **Updates**, and click on **Refresh** to update your that host's packages.
 
-3. Connect to your Proxmox Hypervisor (example: **YOUR-HYPERVISOR-HOSTNAME**), with a user that has full administrative priveledges (example: `root`).
+3. Open a shell on the machine where you want to run the daemon. This can be the Proxmox node, but it does not need to be.
 
    ```bash
-   ssh root@YOUR-HYPERVISOR-HOSTNAME
+   ssh your-user@YOUR-DAEMON-HOSTNAME
    ```
 
 4. Install Python and Dependencies
@@ -108,11 +109,11 @@ This guide will take you from a fresh Proxmox installation to a fully working Re
    # Create the configuration file
    cat > /opt/proxmox-redfish/config/params.env << 'EOF'
    # Proxmox Configuration
-   PROXMOX_HOST="$(hostname -I | awk '{print $1}')"
+   PROXMOX_HOST="YOUR-PROXMOX-API-HOSTNAME-OR-IP"
    PROXMOX_USER="root@pam"
    PROXMOX_PASSWORD="your-proxmox-root-password"
    PROXMOX_API_PORT="8006"
-   PROXMOX_NODE="$(hostname)"
+   PROXMOX_NODE="YOUR-PROXMOX-NODE-NAME"
    PROXMOX_ISO_STORAGE="local"
 
    # SSL Configuration
@@ -127,7 +128,8 @@ This guide will take you from a fresh Proxmox installation to a fully working Re
    VERIFY_SSL="false"
    EOF
    ```
-   **Important**: Replace `your-proxmox-root-password` with your actual Proxmox root password.
+   **Important**: Replace the placeholder values with your real Proxmox API host, node name, and credentials.
+   `PROXMOX_ISO_STORAGE` must point to a Proxmox storage that allows `iso` content; the daemon uploads through the Proxmox API and does not need direct access to `/var/lib/vz`.
 
 7. Create a systemd service unit (so we can run the proxmox-redfish daemon as a service)
 

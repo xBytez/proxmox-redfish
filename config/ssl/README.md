@@ -80,9 +80,9 @@ The daemon automatically uses these default paths:
 
 ```bash
 # Default SSL certificate paths (can be overridden with environment variables)
-SSL_CERT_FILE=/opt/redfish_daemon/config/ssl/server.crt
-SSL_KEY_FILE=/opt/redfish_daemon/config/ssl/server.key
-SSL_CA_FILE=/opt/redfish_daemon/config/ssl/ca.crt  # Optional
+SSL_CERT_FILE=/opt/proxmox-redfish/config/ssl/server.crt
+SSL_KEY_FILE=/opt/proxmox-redfish/config/ssl/server.key
+SSL_CA_FILE=/opt/proxmox-redfish/config/ssl/ca.crt  # Optional
 ```
 
 ### Environment Variable Override

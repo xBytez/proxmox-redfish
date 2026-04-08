@@ -118,6 +118,15 @@ class TestRedfishProxmox(unittest.TestCase):
             "UPID:pve:00001239:1239:5683:9017:test:qemu:100:testuser@pam:"
         )
 
+        # Mock storage operations
+        mock_proxmox.nodes.return_value.storage.return_value.get.return_value = {"content": "iso,images"}
+        mock_proxmox.nodes.return_value.storage.return_value.content.get.return_value = []
+        mock_proxmox.nodes.return_value.storage.return_value.upload.post.return_value = "UPID:upload-task"
+        mock_proxmox.nodes.return_value.tasks.return_value.status.get.return_value = {
+            "status": "stopped",
+            "exitstatus": "OK",
+        }
+
         return mock_proxmox
 
     def test_power_on_success(self):
@@ -364,21 +373,64 @@ class TestRedfishProxmox(unittest.TestCase):
         self.assertEqual(result, iso_path)  # Should return unchanged for local storage
 
     def test_ensure_iso_available_url(self):
-        """Test ISO availability for URL (simplified to avoid network requests)"""
+        """Test ISO availability for URL via Proxmox storage upload"""
         mock_proxmox = self.create_mock_proxmox()
         iso_url = "http://example.com/test.iso"
+        content = b"fake iso bytes"
 
-        # Test with a local storage reference (should return unchanged)
         local_iso = "local:iso/test.iso"
-        result = _ensure_iso_available(mock_proxmox, local_iso)
-        self.assertEqual(result, local_iso)
+        self.assertEqual(_ensure_iso_available(mock_proxmox, local_iso), local_iso)
 
-        # Test with a URL - just verify the function handles it without hanging
-        # We'll skip the actual URL processing to avoid network requests
-        with patch("proxmox_redfish.proxmox_redfish._ensure_iso_available") as mock_func:
-            mock_func.return_value = "local:iso/downloaded.iso"
-            result = mock_func(mock_proxmox, iso_url)
-            self.assertEqual(result, "local:iso/downloaded.iso")
+        mock_response = Mock()
+        mock_response.iter_content.return_value = [content]
+        mock_response.raise_for_status.return_value = None
+
+        uploaded_files = []
+
+        def capture_upload(*args, **kwargs):
+            uploaded = kwargs.get("filename")
+            if hasattr(uploaded, "name"):
+                uploaded_files.append(os.path.basename(uploaded.name))
+            return "UPID:upload-task"
+
+        mock_proxmox.nodes.return_value.storage.return_value.upload.post.side_effect = capture_upload
+
+        with patch("proxmox_redfish.proxmox_redfish.requests.get", return_value=mock_response):
+            result = _ensure_iso_available(mock_proxmox, iso_url)
+
+        self.assertEqual(result, "local:iso/test.iso")
+        self.assertEqual(uploaded_files, ["test.iso"])
+
+    def test_ensure_iso_available_url_conflict_uses_hash_suffix(self):
+        """Test conflicting ISO names get a hash suffix before upload"""
+        mock_proxmox = self.create_mock_proxmox()
+        iso_url = "http://example.com/test.iso"
+        content = b"new iso bytes"
+
+        mock_response = Mock()
+        mock_response.iter_content.return_value = [content]
+        mock_response.raise_for_status.return_value = None
+
+        mock_proxmox.nodes.return_value.storage.return_value.content.get.side_effect = [
+            [{"volid": "local:iso/test.iso", "size": 1}],
+            [],
+        ]
+
+        uploaded_files = []
+
+        def capture_upload(*args, **kwargs):
+            uploaded = kwargs.get("filename")
+            if hasattr(uploaded, "name"):
+                uploaded_files.append(os.path.basename(uploaded.name))
+            return "UPID:upload-task"
+
+        mock_proxmox.nodes.return_value.storage.return_value.upload.post.side_effect = capture_upload
+
+        with patch("proxmox_redfish.proxmox_redfish.requests.get", return_value=mock_response):
+            result = _ensure_iso_available(mock_proxmox, iso_url)
+
+        self.assertEqual(result, "local:iso/test_9387a8e8.iso")
+        self.assertEqual(uploaded_files, ["test_9387a8e8.iso"])
 
     def test_handle_proxmox_error_404(self):
         """Test Proxmox error handling for 404"""

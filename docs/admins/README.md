@@ -20,7 +20,7 @@ The daemon can be configured using environment variables. Here are all available
 | `PROXMOX_USER` | `username` | Proxmox username (i.e., `root@pam`) |
 | `PROXMOX_PASSWORD` | `password` | Proxmox password or API token |
 | `PROXMOX_NODE` | `pve-node-name` | Proxmox node name |
-| `PROXMOX_ISO_STORAGE` | `local` | Storage pool for ISO downloads |
+| `PROXMOX_ISO_STORAGE` | `local` | Proxmox storage name used for ISO uploads; it must support `iso` content |
 | `VERIFY_SSL` | `false` | Verify SSL certificates for Proxmox API |
 
 #### Redfish Configuration
@@ -34,9 +34,9 @@ The daemon can be configured using environment variables. Here are all available
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SSL_CERT_FILE` | `/opt/redfish_daemon/config/ssl/server.crt` | SSL certificate file path |
-| `SSL_KEY_FILE` | `/opt/redfish_daemon/config/ssl/server.key` | SSL private key file path |
-| `SSL_CA_FILE` | `/opt/redfish_daemon/config/ssl/ca.crt` | CA certificate bundle (optional) |
+| `SSL_CERT_FILE` | `/opt/proxmox-redfish/config/ssl/server.crt` | SSL certificate file path |
+| `SSL_KEY_FILE` | `/opt/proxmox-redfish/config/ssl/server.key` | SSL private key file path |
+| `SSL_CA_FILE` | `/opt/proxmox-redfish/config/ssl/ca.crt` | CA certificate bundle (optional) |
 
 #### Logging Configuration
 
@@ -77,6 +77,8 @@ export REDFISH_LOG_LEVEL="INFO"
 export REDFISH_LOGGING_ENABLED="true"
 EOF
 ```
+
+`PROXMOX_ISO_STORAGE` must reference a Proxmox storage that supports `iso` content. The daemon uploads ISOs through the Proxmox API, so it does not need the storage mounted locally.
 
 ### JSON Configuration File
 
@@ -434,17 +436,17 @@ For enhanced security, run the service as a non-root user:
    pvesm status
    ```
 
-2. Verify ISO storage permissions
+2. Verify the configured storage supports ISO content
    ```bash
-   ls -la /var/lib/vz/template/iso/
+   pvesm status --content iso
    ```
 
 3. Check available ISOs
    ```bash
-   pvesm list local:iso
+   pvesm list "${PROXMOX_ISO_STORAGE:-local}"
    ```
 
-4. Test ISO download manually
+4. Test the source ISO URL manually
    ```bash
    wget -O /tmp/test.iso "https://example.com/test.iso"
    ```
