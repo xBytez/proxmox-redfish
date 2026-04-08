@@ -123,6 +123,8 @@ This guide will take you from a fresh install to a working Redfish API daemon. T
    # Logging Configuration
    REDFISH_LOG_LEVEL="INFO"
    REDFISH_LOGGING_ENABLED="true"
+   REDFISH_HOST="0.0.0.0"
+   REDFISH_PORT="8443"
 
    # SSL Verification (for Proxmox API)
    VERIFY_SSL="false"
@@ -162,6 +164,8 @@ This guide will take you from a fresh install to a working Redfish API daemon. T
    systemctl daemon-reload
    systemctl enable proxmox-redfish.service --now
    ```
+
+   Set `REDFISH_HOST` to a specific interface address, such as `10.69.42.253`, if you do not want the daemon listening on every interface.
 
 8. Start the service
 

@@ -868,15 +868,17 @@ def reorder_boot_order(proxmox: ProxmoxAPI, vm_id: int, current_order: str, targ
         cd_dev = None
         net_dev = None
 
-        # Check for hard drives and CD-ROMs (SCSI, SATA, IDE)
-        for dev_type in ["scsi", "sata", "ide"]:
+        # Check for hard drives and CD-ROMs (VirtIO, SCSI, SATA, IDE)
+        for dev_type in ["scsi", "sata", "ide", "virtio"]:
             for i in range(4):  # ide0-3, scsi0-3, sata0-3 (simplified range)
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     dev_value = config[dev_key]
                     if "media=cdrom" in dev_value:
                         cd_dev = dev_key  # CD-ROM found
-                    elif dev_type in ["scsi", "sata"] or (dev_type == "ide" and "media=cdrom" not in dev_value):
+                    elif dev_type in ["scsi", "sata", "virtio"] or (
+                        dev_type == "ide" and "media=cdrom" not in dev_value
+                    ):
                         disk_devs.append(dev_key)  # Hard drive found
 
         # Check for network devices
@@ -2209,17 +2211,17 @@ class RedfishRequestHandler(BaseHTTPRequestHandler):
 
 
 # Server function (unchanged)
-def run_server(port: int = 8000) -> None:
-    server_address = ("", port)
+def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
+    server_address = (host, port)
     httpd = socketserver.TCPServer(server_address, RedfishRequestHandler)
 
-    print(f"Redfish server running on port {port}...")
+    print(f"Redfish server running on {host}:{port}...")
     httpd.serve_forever()
 
 
 # Server function with configurable SSL certificates
-def run_server_ssl(port: int = 443) -> None:
-    server_address = ("", port)
+def run_server_ssl(host: str = "0.0.0.0", port: int = 443) -> None:
+    server_address = (host, port)
     httpd = socketserver.TCPServer(server_address, RedfishRequestHandler)
 
     # Wrap the socket with SSL
@@ -2244,8 +2246,8 @@ def run_server_ssl(port: int = 443) -> None:
 
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
-    print(f"Redfish server running on port {port} with SSL...")
-    logger.info(f"Redfish server started on port {port} with SSL certificates")
+    print(f"Redfish server running on {host}:{port} with SSL...")
+    logger.info(f"Redfish server started on {host}:{port} with SSL certificates")
     httpd.serve_forever()
 
 
@@ -2294,6 +2296,10 @@ def main() -> None:
         port_value = os.getenv("REDFISH_PORT")
         if port_value:
             config.setdefault("redfish", {})["port"] = int(port_value)
+    if os.getenv("REDFISH_HOST"):
+        host_value = os.getenv("REDFISH_HOST")
+        if host_value:
+            config.setdefault("redfish", {})["host"] = host_value
     if os.getenv("SSL_CERT_FILE"):
         config.setdefault("redfish", {})["ssl_cert"] = os.getenv("SSL_CERT_FILE")
     if os.getenv("SSL_KEY_FILE"):
@@ -2323,6 +2329,7 @@ def main() -> None:
     try:
         logger.info("Starting Proxmox Redfish Daemon...")
         logger.info(f"Proxmox Host: {proxmox_config['host']}")
+        logger.info(f"Redfish Bind Host: {config['redfish']['host']}")
         logger.info(f"Redfish Port: {config['redfish']['port']}")
 
         # Check if SSL certificates are configured
@@ -2332,11 +2339,11 @@ def main() -> None:
         if ssl_cert and ssl_key:
             # Start SSL server
             logger.info("Starting Redfish server with SSL...")
-            run_server_ssl(config["redfish"]["port"])
+            run_server_ssl(config["redfish"]["host"], config["redfish"]["port"])
         else:
             # Start regular HTTP server
             logger.info("Starting Redfish server without SSL...")
-            run_server(config["redfish"]["port"])
+            run_server(config["redfish"]["host"], config["redfish"]["port"])
 
     except KeyboardInterrupt:
         logger.info("Shutting down Proxmox Redfish Daemon...")

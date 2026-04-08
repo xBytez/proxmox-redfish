@@ -28,7 +28,7 @@ The daemon can be configured using environment variables. Here are all available
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REDFISH_PORT` | `8443` | Port for the Redfish daemon |
-| `REDFISH_HOST` | `0.0.0.0` | Host to bind the daemon to |
+| `REDFISH_HOST` | `0.0.0.0` | Host/IP to bind the daemon to; set a specific address to listen on one interface only |
 
 #### SSL Configuration
 
@@ -80,6 +80,7 @@ EOF
 
 `PROXMOX_HOST` can point at any reachable Proxmox cluster node, an API VIP, or a comma-separated list of hosts for simple failover. `PROXMOX_NODE` is optional and is only used as a fallback if the daemon cannot resolve a VM's current node from the cluster API.
 `PROXMOX_ISO_STORAGE` must reference a Proxmox storage that supports `iso` content. The daemon uploads ISOs through the Proxmox API, so it does not need the storage mounted locally.
+Set `REDFISH_HOST` to a specific bind address, such as `10.69.42.253`, if the daemon should not listen on all interfaces.
 
 ### JSON Configuration File
 

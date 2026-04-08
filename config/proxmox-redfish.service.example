@@ -12,10 +12,12 @@ Environment="PROXMOX_PASSWORD=YOUR_USER_PASSWORD_HERE"
 Environment="PROXMOX_NODE="
 Environment="REDFISH_LOGGING_ENABLED=True"
 Environment="REDFISH_LOG_LEVEL=INFO"
+Environment="REDFISH_HOST=0.0.0.0"
+Environment="REDFISH_PORT=8000"
 Environment="PROXMOX_ISO_STORAGE=local"
 Environment="SSL_CERT_FILE=/opt/proxmox-redfish/config/ssl/server.crt"
 Environment="SSL_KEY_FILE=/opt/proxmox-redfish/config/ssl/server.key"
-ExecStart=/opt/proxmox-redfish/venv/bin/python /opt/proxmox-redfish/src/proxmox_redfish/proxmox_redfish.py --port 8000
+ExecStart=/opt/proxmox-redfish/venv/bin/python /opt/proxmox-redfish/src/proxmox_redfish/proxmox_redfish.py
 WorkingDirectory=/opt/proxmox-redfish
 Restart=always
 Type=simple
