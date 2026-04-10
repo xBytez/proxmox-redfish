@@ -9,13 +9,13 @@ for VM operations through the Redfish protocol.
 import argparse
 import base64
 import binascii
-import fcntl
 import hashlib
 import json
 import logging
 import logging.handlers
 import os
 import secrets
+import shutil
 import socketserver
 import ssl
 import sys
@@ -197,17 +197,7 @@ def get_proxmox_api(headers: Any) -> ProxmoxAPI:
     if not PROXMOX_HOST.strip():
         raise Exception("Failed to connect to Proxmox API: PROXMOX_HOST is empty")
 
-    try:
-        raise Exception(f"Failed to connect to Proxmox API: {str(last_error)}")
-    except Exception as e:
-        raise Exception(f"Failed to connect to Proxmox API: {str(e)}")
-
-
-def get_credentials(token: str) -> Tuple[str, str]:
-    if token in sessions:
-        session = sessions[token]
-        return session["username"], session["password"]
-    raise Exception("No credentials found for token")
+    raise Exception(f"Failed to connect to Proxmox API: {str(last_error)}")
 
 
 def check_user_vm_permission(proxmox: ProxmoxAPI, username: str, vm_id: int) -> bool:
@@ -351,11 +341,14 @@ def get_file_lock(filename: str) -> threading.Lock:
 
 def _list_cluster_vm_resources(proxmox: ProxmoxAPI) -> list[Dict[str, Any]]:
     """List cluster-wide VM resources and keep only QEMU entries."""
-    resources_api = proxmox.cluster.resources
     try:
-        resources = resources_api.get(type="vm")
-    except Exception:
-        resources = resources_api.get()
+        resources = proxmox.cluster.resources.get(type="vm")
+    except ResourceException as e:
+        if e.status_code in (400, 422):
+            # Older Proxmox versions may not support the type filter parameter
+            resources = proxmox.cluster.resources.get()
+        else:
+            raise
     if not isinstance(resources, list):
         return []
     return [resource for resource in resources if resource.get("type") == "qemu"]
@@ -411,10 +404,15 @@ def _get_default_node(proxmox: ProxmoxAPI) -> str:
     raise ValueError("PROXMOX_NODE is required only as a fallback when no VM node is available")
 
 
-def _wait_for_task_completion(proxmox: ProxmoxAPI, task_id: str, node_name: str, poll_interval: int = 2) -> None:
+def _wait_for_task_completion(
+    proxmox: ProxmoxAPI, task_id: str, node_name: str, poll_interval: int = 2, timeout: int = 3600
+) -> None:
     """Wait for a Proxmox task to finish successfully."""
     logger.info("Waiting for task completion: %s", task_id)
+    deadline = time.monotonic() + timeout
     while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Timed out waiting for task {task_id} after {timeout}s")
         status = proxmox.nodes(node_name).tasks(task_id).status.get()
         if status is None:
             raise Exception(f"Failed to get task status for {task_id}")
@@ -495,59 +493,7 @@ def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str, node_name: str) -> Non
     _wait_for_task_completion(proxmox, task_id, node_name)
 
 
-def atomic_file_write(temp_file_path: str, target_path: str, timeout: int = 300) -> None:
-    """
-    Atomically write a file to prevent corruption during concurrent access.
-    Uses atomic rename operation to ensure file integrity.
-    """
-    # Create a temporary file in the same directory as target
-    target_dir = os.path.dirname(target_path)
-    temp_target = os.path.join(target_dir, f".tmp_{os.path.basename(target_path)}")
-
-    try:
-        # Copy the temp file to the target directory
-        import shutil
-
-        shutil.copy2(temp_file_path, temp_target)
-
-        # Set proper permissions
-        os.chmod(temp_target, 0o644)
-
-        # Atomic rename - this is guaranteed to be atomic on POSIX systems
-        os.rename(temp_target, target_path)
-        logger.info("Atomic file write completed: %s", target_path)
-
-    except Exception as e:
-        # Clean up temp file if it exists
-        if os.path.exists(temp_target):
-            try:
-                os.unlink(temp_target)
-            except Exception:
-                pass
-        raise e
-
-
-def safe_file_hash(file_path: str, timeout: int = 60) -> Optional[str]:
-    """
-    Safely calculate hash of a file with timeout and error handling.
-    """
-    try:
-        hash_obj = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            # Use file locking to prevent reading while file is being written
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
-            try:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    hash_obj.update(chunk)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Release lock
-        return hash_obj.hexdigest()
-    except Exception as e:
-        logger.warning("Failed to calculate hash for %s: %s", file_path, str(e))
-        return None
-
-
-# Power control functions (unchanged)
+# Power control functions
 def power_on(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
     logger.info("Power On request for VM %s", vm_id)
     try:
@@ -716,6 +662,21 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str, node_name: Opt
             entries = _list_iso_storage_content(proxmox, storage_node)
             existing_entry = _find_iso_entry(entries, fname)
 
+            # Fast path: if the ISO already exists, check Content-Length via HEAD
+            # before downloading the full file.
+            if existing_entry:
+                try:
+                    head_resp = requests.head(url_or_volid, timeout=30, verify=VERIFY_SSL, allow_redirects=True)
+                    remote_size = int(head_resp.headers.get("Content-Length", -1))
+                    if remote_size != -1 and remote_size == existing_entry.get("size"):
+                        logger.info(
+                            "ISO already present with matching size (HEAD check), reusing %s",
+                            existing_entry.get("volid"),
+                        )
+                        return existing_entry["volid"]
+                except Exception:
+                    pass  # Fall through to full download for hash comparison
+
             with tempfile.TemporaryDirectory(prefix="proxmox-redfish-iso-") as tmp_dir:
                 download_path = os.path.join(tmp_dir, fname)
                 downloaded_hash_hex, downloaded_size = _download_iso_to_file(url_or_volid, download_path)
@@ -868,21 +829,22 @@ def reorder_boot_order(proxmox: ProxmoxAPI, vm_id: int, current_order: str, targ
         cd_dev = None
         net_dev = None
 
-        # Check for hard drives and CD-ROMs (VirtIO, SCSI, SATA, IDE)
-        for dev_type in ["scsi", "sata", "ide", "virtio"]:
-            for i in range(4):  # ide0-3, scsi0-3, sata0-3 (simplified range)
+        # Check for hard drives and CD-ROMs across all device types.
+        # Proxmox limits: ide 0-3, sata 0-5, scsi 0-30, virtio 0-15.
+        # VirtIO devices are block-only (no media=cdrom support).
+        dev_ranges = {"scsi": 31, "sata": 6, "ide": 4, "virtio": 16}
+        for dev_type, dev_count in dev_ranges.items():
+            for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     dev_value = config[dev_key]
-                    if "media=cdrom" in dev_value:
-                        cd_dev = dev_key  # CD-ROM found
-                    elif dev_type in ["scsi", "sata", "virtio"] or (
-                        dev_type == "ide" and "media=cdrom" not in dev_value
-                    ):
+                    if dev_type != "virtio" and "media=cdrom" in dev_value:
+                        cd_dev = dev_key  # CD-ROM found (IDE/SCSI/SATA only)
+                    else:
                         disk_devs.append(dev_key)  # Hard drive found
 
-        # Check for network devices
-        for i in range(4):  # net0-3 (simplified range)
+        # Check for network devices (Proxmox supports net0-net31)
+        for i in range(32):
             net_key = f"net{i}"
             if net_key in config:
                 net_dev = net_key
@@ -1052,7 +1014,11 @@ def validate_token(headers: Any) -> Tuple[bool, str]:
                 if "@" not in username:
                     username += "@pam"
                 if authenticate_user(username, password):
-                    token = f"{username}-{password}"
+                    # Purge expired Basic auth sessions to prevent unbounded growth
+                    expired = [t for t, s in sessions.items() if time.time() - s.get("created", 0) >= 3600]
+                    for t in expired:
+                        del sessions[t]
+                    token = secrets.token_hex(16)
                     sessions[token] = {"created": time.time(), "username": username, "password": password}
                     return True, username
                 else:
@@ -1187,8 +1153,8 @@ def get_storage_detail(
 
         # Get disk drives from config
         drives = []
-        for dev_type in ["scsi", "sata", "ide"]:
-            for i in range(4):
+        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+            for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     drives.append({"Id": dev_key, "Name": f"Drive {dev_key}"})
@@ -1258,8 +1224,8 @@ def get_volume_collection(
 
         # Get volumes from config
         volumes = []
-        for dev_type in ["scsi", "sata", "ide"]:
-            for i in range(4):
+        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+            for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     volumes.append({"@odata.id": f"/redfish/v1/Systems/{vm_id}/Storage/{storage_id}/Volumes/{dev_key}"})
@@ -1293,8 +1259,8 @@ def get_controller_collection(
 
         # Get controllers from config
         controllers = []
-        for dev_type in ["scsi", "sata", "ide"]:
-            for i in range(4):
+        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+            for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     controllers.append(
@@ -1323,9 +1289,9 @@ def get_ethernet_interface_collection(
                 "Ethernet interface collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
             )
 
-        # Get network interfaces from config
+        # Get network interfaces from config (Proxmox supports net0-net31)
         interfaces = []
-        for i in range(4):
+        for i in range(32):
             net_key = f"net{i}"
             if net_key in config:
                 interfaces.append({"@odata.id": f"/redfish/v1/Systems/{vm_id}/EthernetInterfaces/{net_key}"})
@@ -2292,14 +2258,12 @@ def main() -> None:
         config.setdefault("proxmox", {})["user"] = os.getenv("PROXMOX_USER")
     if os.getenv("PROXMOX_PASSWORD"):
         config.setdefault("proxmox", {})["password"] = os.getenv("PROXMOX_PASSWORD")
-    if os.getenv("REDFISH_PORT"):
-        port_value = os.getenv("REDFISH_PORT")
-        if port_value:
-            config.setdefault("redfish", {})["port"] = int(port_value)
-    if os.getenv("REDFISH_HOST"):
-        host_value = os.getenv("REDFISH_HOST")
-        if host_value:
-            config.setdefault("redfish", {})["host"] = host_value
+    port_value = os.getenv("REDFISH_PORT")
+    if port_value:
+        config.setdefault("redfish", {})["port"] = int(port_value)
+    host_value = os.getenv("REDFISH_HOST")
+    if host_value:
+        config.setdefault("redfish", {})["host"] = host_value
     if os.getenv("SSL_CERT_FILE"):
         config.setdefault("redfish", {})["ssl_cert"] = os.getenv("SSL_CERT_FILE")
     if os.getenv("SSL_KEY_FILE"):
