@@ -1310,6 +1310,13 @@ def get_vm_status(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tupl
         return handle_proxmox_error("VM status retrieval", e, vm_id)
 
 
+# When running as a script (__main__), register this module under its
+# package-qualified name before loading handler.py.  All symbols handler.py
+# needs are defined by this point, so the import resolves correctly without
+# triggering a second full execution of this file.
+if "proxmox_redfish.proxmox_redfish" not in sys.modules:
+    sys.modules["proxmox_redfish.proxmox_redfish"] = sys.modules[__name__]
+
 from proxmox_redfish.handler import RedfishRequestHandler  # noqa: E402
 
 

@@ -21,10 +21,24 @@ VERIFY_SSL = os.getenv("VERIFY_SSL", "false").lower() == "true"
 iso_file_locks: Dict[str, threading.Lock] = {}
 iso_file_locks_lock = threading.Lock()
 
-# _get_storage_node is imported here via a controlled circular import:
-# proxmox_redfish.py defines _get_storage_node before importing this module,
-# so it is available in sys.modules by the time this line executes.
-from proxmox_redfish.proxmox_redfish import _get_storage_node  # noqa: E402
+
+def _resolve_storage_node(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> str:
+    """Return the node to use for storage operations."""
+    if node_name:
+        return node_name
+    proxmox_node = os.getenv("PROXMOX_NODE", "").strip()
+    if proxmox_node:
+        return proxmox_node
+    try:
+        nodes = proxmox.nodes.get()
+        if isinstance(nodes, list):
+            for node in nodes:
+                n = node.get("node")
+                if n:
+                    return str(n)
+    except Exception:
+        pass
+    raise ValueError("Could not determine storage node; set PROXMOX_NODE env var")
 
 
 def get_file_lock(filename: str) -> threading.Lock:
@@ -157,7 +171,7 @@ def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str, node_name: Opt
         if not fname.endswith(".iso"):
             fname += ".iso"  # Ensure .iso extension
 
-        storage_node = _get_storage_node(proxmox, node_name)
+        storage_node = _resolve_storage_node(proxmox, node_name)
         storage_info = _get_storage_details(proxmox, storage_node)
         if storage_info and not _storage_supports_iso(storage_info):
             raise ValueError(f"Storage {PROXMOX_ISO_STORAGE} does not support ISO content")
