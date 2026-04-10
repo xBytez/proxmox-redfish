@@ -23,45 +23,48 @@ from typing import Any, Dict, Optional, Tuple, Union
 import requests
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
+from proxmox_redfish.iso import (
+    _ensure_iso_available,
+    _find_iso_entry,
+    _get_storage_details,
+    _list_iso_storage_content,
+    _storage_supports_iso,
+    _upload_iso_file,
+    _wait_for_task_completion,
+    _download_iso_to_file,
+    get_file_lock,
+)
 
-# Configure logging to send to system journal
-# Logging configuration with configurable levels
 logger = logging.getLogger("proxmox-redfish")
 
-# Get logging level from environment variable
-# Valid levels: CRITICAL, ERROR, WARNING, INFO, DEBUG
-# Default to INFO for production use
-log_level_str = os.getenv("REDFISH_LOG_LEVEL", "INFO").upper()
-log_level_map = {
-    "CRITICAL": logging.CRITICAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-}
 
-# Validate and set logging level
-if log_level_str in log_level_map:
-    log_level = log_level_map[log_level_str]
-else:
-    print(f"Warning: Invalid REDFISH_LOG_LEVEL '{log_level_str}', using INFO")
-    log_level = logging.INFO
+def _configure_logging() -> None:
+    """Configure logging from environment variables. Called once from main()."""
+    level_str = os.getenv("REDFISH_LOG_LEVEL", "INFO").upper()
+    level_map = {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+    }
+    if level_str not in level_map:
+        print(f"Warning: Invalid REDFISH_LOG_LEVEL '{level_str}', using INFO", file=sys.stderr)
+        level_str = "INFO"
+    level = level_map[level_str]
 
-# Check if logging is enabled at all
-logging_enabled = os.getenv("REDFISH_LOGGING_ENABLED", "true").lower() == "true"
+    if os.getenv("REDFISH_LOGGING_ENABLED", "true").lower() != "true":
+        logger.addHandler(logging.NullHandler())
+        return
 
-if logging_enabled:
-    # Configure logging with the specified level
     logging.basicConfig(
-        level=log_level,
+        level=level,
         format="%(asctime)s %(levelname)s:%(lineno)d: %(message)s",
         handlers=[logging.handlers.SysLogHandler(address="/dev/log")],
     )
-    logger.setLevel(log_level)
-    logger.info("Proxmox-Redfish daemon started with log level: %s", log_level_str)
-else:
-    logger.handlers = [logging.NullHandler()]
-    print("Logging disabled via REDFISH_LOGGING_ENABLED=false")
+    logger.setLevel(level)
+    logger.info("Proxmox-Redfish daemon started with log level: %s", level_str)
+
 
 # Proxmox configuration from environment variables with fallbacks
 PROXMOX_HOST = os.getenv("PROXMOX_HOST", "pve-node-hostname")
@@ -399,19 +402,6 @@ def _get_default_node(proxmox: ProxmoxAPI) -> str:
 
     raise ValueError("PROXMOX_NODE is required only as a fallback when no VM node is available")
 
-
-# _get_storage_node is defined above; iso.py can now import it safely
-from proxmox_redfish.iso import (  # noqa: E402
-    _ensure_iso_available,
-    _find_iso_entry,
-    _get_storage_details,
-    _list_iso_storage_content,
-    _storage_supports_iso,
-    _upload_iso_file,
-    _wait_for_task_completion,
-    _download_iso_to_file,
-    get_file_lock,
-)
 
 
 # Power control functions
@@ -1359,11 +1349,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Setup logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level), format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    logger = logging.getLogger(__name__)
+    _configure_logging()
 
     # Load configuration
     config = {}
@@ -1447,26 +1433,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-__all__ = [
-    "power_on",
-    "power_off",
-    "reboot",
-    "reset_vm",
-    "manage_virtual_media",
-    "get_vm_status",
-    "get_bios",
-    "validate_token",
-    "get_proxmox_api",
-    "handle_proxmox_error",
-    "reorder_boot_order",
-    "_ensure_iso_available",
-    "ProxmoxAPI",
-    "sessions",
-    "AUTH",
-    "SECURE",
-    "PROXMOX_HOST",
-    "PROXMOX_USER",
-    "PROXMOX_PASSWORD",
-    "PROXMOX_NODE",
-    "VERIFY_SSL",
-]
