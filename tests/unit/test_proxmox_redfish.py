@@ -24,8 +24,8 @@ import unittest
 from io import BytesIO
 from unittest.mock import Mock, patch
 
+from proxmox_redfish.handler import RedfishRequestHandler
 from proxmox_redfish.proxmox_redfish import (
-    RedfishRequestHandler,
     _ensure_iso_available,
     get_bios,
     get_vm_status,

@@ -1301,11 +1301,9 @@ def get_vm_status(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tupl
         return handle_proxmox_error("VM status retrieval", e, vm_id)
 
 
-from proxmox_redfish.handler import RedfishRequestHandler  # noqa: E402
-
-
 # Server function
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
+    from proxmox_redfish.handler import RedfishRequestHandler
     server_address = (host, port)
     httpd = socketserver.TCPServer(server_address, RedfishRequestHandler)
 
@@ -1315,6 +1313,7 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
 
 # Server function with configurable SSL certificates
 def run_server_ssl(host: str = "0.0.0.0", port: int = 443) -> None:
+    from proxmox_redfish.handler import RedfishRequestHandler
     server_address = (host, port)
     httpd = socketserver.TCPServer(server_address, RedfishRequestHandler)
 
@@ -1449,7 +1448,6 @@ if __name__ == "__main__":
     main()
 
 __all__ = [
-    "RedfishRequestHandler",
     "power_on",
     "power_off",
     "reboot",
