@@ -20,6 +20,15 @@ import sys
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
+# When run as a script (ExecStart=.../python proxmox_redfish.py), sys.path[0] is
+# the proxmox_redfish/ directory, which makes `proxmox_redfish` resolve to
+# proxmox_redfish.py (a module) rather than the package directory.  Ensure the
+# src/ parent is in sys.path so sub-module imports (proxmox_redfish.iso, etc.)
+# resolve to the package directory.
+_pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _pkg_parent not in sys.path:
+    sys.path.insert(0, _pkg_parent)
+
 import requests
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
