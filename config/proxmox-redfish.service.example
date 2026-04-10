@@ -17,8 +17,8 @@ Environment="REDFISH_PORT=8000"
 Environment="PROXMOX_ISO_STORAGE=local"
 Environment="SSL_CERT_FILE=/opt/proxmox-redfish/config/ssl/server.crt"
 Environment="SSL_KEY_FILE=/opt/proxmox-redfish/config/ssl/server.key"
-ExecStart=/opt/proxmox-redfish/venv/bin/python /opt/proxmox-redfish/src/proxmox_redfish/proxmox_redfish.py
-WorkingDirectory=/opt/proxmox-redfish
+WorkingDirectory=/opt/proxmox-redfish/src
+ExecStart=/opt/proxmox-redfish/venv/bin/python -m proxmox_redfish.proxmox_redfish
 Restart=always
 Type=simple
 
