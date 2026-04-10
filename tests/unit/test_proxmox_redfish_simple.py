@@ -399,7 +399,7 @@ class TestRedfishProxmox(unittest.TestCase):
 
         mock_proxmox.nodes.return_value.storage.return_value.upload.post.side_effect = capture_upload
 
-        with patch("proxmox_redfish.proxmox_redfish.requests.get", return_value=mock_response):
+        with patch("proxmox_redfish.iso.requests.get", return_value=mock_response):
             result = _ensure_iso_available(mock_proxmox, iso_url)
 
         self.assertEqual(result, "local:iso/test.iso")
@@ -430,7 +430,7 @@ class TestRedfishProxmox(unittest.TestCase):
 
         mock_proxmox.nodes.return_value.storage.return_value.upload.post.side_effect = capture_upload
 
-        with patch("proxmox_redfish.proxmox_redfish.requests.get", return_value=mock_response):
+        with patch("proxmox_redfish.iso.requests.get", return_value=mock_response):
             result = _ensure_iso_available(mock_proxmox, iso_url)
 
         self.assertEqual(result, "local:iso/test_9387a8e8.iso")

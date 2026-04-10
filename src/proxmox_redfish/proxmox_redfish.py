@@ -9,20 +9,15 @@ for VM operations through the Redfish protocol.
 import argparse
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import logging.handlers
 import os
 import secrets
-import shutil
 import socketserver
 import ssl
 import sys
-import tempfile
-import threading
 import time
-from http.server import BaseHTTPRequestHandler
 from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
@@ -91,16 +86,16 @@ SSL_CA_FILE = os.getenv("SSL_CA_FILE", "/opt/proxmox-redfish/config/ssl/ca.crt")
 AUTH = "Basic"
 SECURE = "Always"
 
+# Session TTL in seconds (1 hour)
+SESSION_TTL_SECONDS = 3600
+
+# Proxmox device limits per type: (device_type, max_count)
+DISK_DEVICE_RANGES = [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]
+NET_DEVICE_COUNT = 32  # net0–net31
+
 # In-memory session store
 sessions: Dict[str, Dict[str, Any]] = {}
-
-# Global lock for ISO operations to prevent race conditions
-iso_operation_lock = threading.Lock()
-
-# File locks for individual ISO files
-iso_file_locks = {}
-iso_file_locks_lock = threading.Lock()
-
+_last_session_purge: float = 0.0
 
 def handle_proxmox_error(
     operation: str, exception: Exception, vm_id: Optional[Union[str, int]] = None
@@ -328,15 +323,16 @@ def authenticate_user(username: str, password: str) -> bool:
         return False
 
 
-def get_file_lock(filename: str) -> threading.Lock:
-    """
-    Get or create a lock for a specific ISO file.
-    This ensures only one thread can modify a specific ISO file at a time.
-    """
-    with iso_file_locks_lock:
-        if filename not in iso_file_locks:
-            iso_file_locks[filename] = threading.Lock()
-        return iso_file_locks[filename]
+def _purge_expired_sessions() -> None:
+    """Remove expired sessions. Rate-limited to run at most once per minute."""
+    global _last_session_purge
+    now = time.time()
+    if now - _last_session_purge < 60:
+        return
+    _last_session_purge = now
+    expired = [t for t, s in sessions.items() if now - s.get("created", 0) >= SESSION_TTL_SECONDS]
+    for t in expired:
+        del sessions[t]
 
 
 def _list_cluster_vm_resources(proxmox: ProxmoxAPI) -> list[Dict[str, Any]]:
@@ -404,93 +400,18 @@ def _get_default_node(proxmox: ProxmoxAPI) -> str:
     raise ValueError("PROXMOX_NODE is required only as a fallback when no VM node is available")
 
 
-def _wait_for_task_completion(
-    proxmox: ProxmoxAPI, task_id: str, node_name: str, poll_interval: int = 2, timeout: int = 3600
-) -> None:
-    """Wait for a Proxmox task to finish successfully."""
-    logger.info("Waiting for task completion: %s", task_id)
-    deadline = time.monotonic() + timeout
-    while True:
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"Timed out waiting for task {task_id} after {timeout}s")
-        status = proxmox.nodes(node_name).tasks(task_id).status.get()
-        if status is None:
-            raise Exception(f"Failed to get task status for {task_id}")
-        if status.get("status") == "stopped":
-            if status.get("exitstatus") == "OK":
-                logger.info("Task completed successfully: %s", task_id)
-                return
-            raise Exception(f"Task failed: {status}")
-        time.sleep(poll_interval)
-
-
-def _get_storage_details(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> Dict[str, Any]:
-    """Fetch metadata for the configured ISO storage."""
-    storage_info = proxmox.nodes(_get_storage_node(proxmox, node_name)).storage(PROXMOX_ISO_STORAGE).get()
-    if isinstance(storage_info, dict):
-        return storage_info
-    return {}
-
-
-def _storage_supports_iso(storage_info: Dict[str, Any]) -> bool:
-    """Check whether the configured storage advertises ISO content support."""
-    content_types = storage_info.get("content")
-    if isinstance(content_types, str):
-        return "iso" in {entry.strip() for entry in content_types.split(",")}
-    if isinstance(content_types, list):
-        return "iso" in content_types
-    return False
-
-
-def _list_iso_storage_content(proxmox: ProxmoxAPI, node_name: Optional[str] = None) -> list[Dict[str, Any]]:
-    """List ISO content entries on the configured storage."""
-    content_api = proxmox.nodes(_get_storage_node(proxmox, node_name)).storage(PROXMOX_ISO_STORAGE).content
-    try:
-        entries = content_api.get(content="iso")
-    except Exception:
-        entries = content_api.get()
-    return entries if isinstance(entries, list) else []
-
-
-def _find_iso_entry(entries: list[Dict[str, Any]], filename: str) -> Optional[Dict[str, Any]]:
-    """Locate an ISO entry by its filename on the configured storage."""
-    target_volid = f"{PROXMOX_ISO_STORAGE}:iso/{filename}"
-    for entry in entries:
-        if entry.get("volid") == target_volid:
-            return entry
-    return None
-
-
-def _download_iso_to_file(url: str, target_path: str) -> Tuple[str, int]:
-    """Download an ISO URL to a local temp file while computing its SHA-256."""
-    logger.info("Downloading ISO from URL: %s", url)
-    response = requests.get(url, stream=True, timeout=600, verify=VERIFY_SSL)
-    response.raise_for_status()
-
-    checksum = hashlib.sha256()
-    size = 0
-    with open(target_path, "wb") as handle:
-        for chunk in response.iter_content(16 << 20):
-            if not chunk:
-                continue
-            handle.write(chunk)
-            checksum.update(chunk)
-            size += len(chunk)
-
-    return checksum.hexdigest(), size
-
-
-def _upload_iso_file(proxmox: ProxmoxAPI, file_path: str, node_name: str) -> None:
-    """Upload an ISO file to the configured Proxmox storage via API."""
-    upload_api = proxmox.nodes(node_name).storage(PROXMOX_ISO_STORAGE).upload
-    with open(file_path, "rb") as iso_file:
-        try:
-            task_id = upload_api.post(content="iso", filename=iso_file)
-        except TypeError:
-            iso_file.seek(0)
-            task_id = upload_api.post(content="iso", filename=os.path.basename(file_path), file=iso_file)
-
-    _wait_for_task_completion(proxmox, task_id, node_name)
+# _get_storage_node is defined above; iso.py can now import it safely
+from proxmox_redfish.iso import (  # noqa: E402
+    _ensure_iso_available,
+    _find_iso_entry,
+    _get_storage_details,
+    _list_iso_storage_content,
+    _storage_supports_iso,
+    _upload_iso_file,
+    _wait_for_task_completion,
+    _download_iso_to_file,
+    get_file_lock,
+)
 
 
 # Power control functions
@@ -619,106 +540,7 @@ def stop_vm(proxmox: ProxmoxAPI, vm_id: int) -> Tuple[Dict[str, Any], int]:
         return handle_proxmox_error("Hard stop", e, vm_id)
 
 
-# This section allows OpenShift ZTP to autoload a generated ISO
-def _ensure_iso_available(proxmox: ProxmoxAPI, url_or_volid: str, node_name: Optional[str] = None) -> str:
-    """
-    Return a storage:iso/… volid, downloading + uploading if needed.
-    Supports HTTP/S URLs and local storage references.
-    Implements hash-based conflict handling and thread-safe concurrent access.
-
-    Args:
-        proxmox: ProxmoxAPI instance
-        url_or_volid: HTTP/S URL or storage:iso/... reference
-
-    Returns:
-        str: storage:iso/filename reference for Proxmox
-    """
-    # Already looks like "storage:iso/…" → nothing to do
-    if ":iso/" in url_or_volid:
-        return url_or_volid
-
-    # Check if it's a URL (http/https)
-    if url_or_volid.startswith(("http://", "https://")):
-        if PROXMOX_ISO_STORAGE == "none":
-            raise ValueError("ISO downloads are disabled (PROXMOX_ISO_STORAGE=none)")
-
-        logger.info("Processing ISO from URL: %s", url_or_volid)
-
-        # Extract filename from URL, handling query parameters
-        fname = os.path.basename(url_or_volid.split("?", 1)[0])
-        if not fname.endswith(".iso"):
-            fname += ".iso"  # Ensure .iso extension
-
-        storage_node = _get_storage_node(proxmox, node_name)
-        storage_info = _get_storage_details(proxmox, storage_node)
-        if storage_info and not _storage_supports_iso(storage_info):
-            raise ValueError(f"Storage {PROXMOX_ISO_STORAGE} does not support ISO content")
-
-        # Get file-specific lock to prevent concurrent access to the same ISO
-        file_lock = get_file_lock(fname)
-
-        with file_lock:
-            logger.info("Acquired lock for ISO file: %s", fname)
-            entries = _list_iso_storage_content(proxmox, storage_node)
-            existing_entry = _find_iso_entry(entries, fname)
-
-            # Fast path: if the ISO already exists, check Content-Length via HEAD
-            # before downloading the full file.
-            if existing_entry:
-                try:
-                    head_resp = requests.head(url_or_volid, timeout=30, verify=VERIFY_SSL, allow_redirects=True)
-                    remote_size = int(head_resp.headers.get("Content-Length", -1))
-                    if remote_size != -1 and remote_size == existing_entry.get("size"):
-                        logger.info(
-                            "ISO already present with matching size (HEAD check), reusing %s",
-                            existing_entry.get("volid"),
-                        )
-                        return existing_entry["volid"]
-                except Exception:
-                    pass  # Fall through to full download for hash comparison
-
-            with tempfile.TemporaryDirectory(prefix="proxmox-redfish-iso-") as tmp_dir:
-                download_path = os.path.join(tmp_dir, fname)
-                downloaded_hash_hex, downloaded_size = _download_iso_to_file(url_or_volid, download_path)
-
-                if existing_entry:
-                    existing_size = existing_entry.get("size")
-                    if existing_size == downloaded_size:
-                        logger.info("ISO already present with matching size, reusing %s", existing_entry.get("volid"))
-                        return existing_entry["volid"]
-
-                    logger.info("Existing ISO name conflict detected, using hash suffix")
-                    name_without_ext, ext = os.path.splitext(fname)
-                    fname = f"{name_without_ext}_{downloaded_hash_hex[:8]}{ext}"
-                    renamed_path = os.path.join(tmp_dir, fname)
-                    os.replace(download_path, renamed_path)
-                    download_path = renamed_path
-
-                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox, storage_node), fname)
-                    if existing_entry:
-                        logger.info("Hash-suffixed ISO already present, reusing %s", existing_entry.get("volid"))
-                        return existing_entry["volid"]
-
-                try:
-                    logger.info("Uploading ISO to storage %s via Proxmox API", PROXMOX_ISO_STORAGE)
-                    _upload_iso_file(proxmox, download_path, storage_node)
-                except Exception as upload_error:
-                    existing_entry = _find_iso_entry(_list_iso_storage_content(proxmox, storage_node), fname)
-                    if existing_entry:
-                        logger.info("ISO became available during upload retry window, reusing %s", existing_entry.get("volid"))
-                        return existing_entry["volid"]
-                    raise Exception(f"API upload failed for {fname}: {upload_error}") from upload_error
-
-            volid = f"{PROXMOX_ISO_STORAGE}:iso/{fname}"
-            logger.info("ISO available as: %s", volid)
-            return volid
-
-    # Not a URL and not a storage reference - return as-is (Proxmox will handle validation)
-    logger.warning("Unknown ISO format: %s", url_or_volid)
-    return url_or_volid
-
-
-# Add this new function to manage VirtualMedia state (replaces manage_virtual_cd)
+# Manage VirtualMedia state
 def manage_virtual_media(
     proxmox: ProxmoxAPI, vm_id: int, action: str, iso_path: Optional[str] = None
 ) -> Tuple[Dict[str, Any], int]:
@@ -830,21 +652,18 @@ def reorder_boot_order(proxmox: ProxmoxAPI, vm_id: int, current_order: str, targ
         net_dev = None
 
         # Check for hard drives and CD-ROMs across all device types.
-        # Proxmox limits: ide 0-3, sata 0-5, scsi 0-30, virtio 0-15.
         # VirtIO devices are block-only (no media=cdrom support).
-        dev_ranges = {"scsi": 31, "sata": 6, "ide": 4, "virtio": 16}
-        for dev_type, dev_count in dev_ranges.items():
+        for dev_type, dev_count in DISK_DEVICE_RANGES:
             for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
                     dev_value = config[dev_key]
                     if dev_type != "virtio" and "media=cdrom" in dev_value:
-                        cd_dev = dev_key  # CD-ROM found (IDE/SCSI/SATA only)
+                        cd_dev = dev_key
                     else:
                         disk_devs.append(dev_key)  # Hard drive found
 
-        # Check for network devices (Proxmox supports net0-net31)
-        for i in range(32):
+        for i in range(NET_DEVICE_COUNT):
             net_key = f"net{i}"
             if net_key in config:
                 net_dev = net_key
@@ -1014,10 +833,7 @@ def validate_token(headers: Any) -> Tuple[bool, str]:
                 if "@" not in username:
                     username += "@pam"
                 if authenticate_user(username, password):
-                    # Purge expired Basic auth sessions to prevent unbounded growth
-                    expired = [t for t, s in sessions.items() if time.time() - s.get("created", 0) >= 3600]
-                    for t in expired:
-                        del sessions[t]
+                    _purge_expired_sessions()
                     token = secrets.token_hex(16)
                     sessions[token] = {"created": time.time(), "username": username, "password": password}
                     return True, username
@@ -1031,7 +847,7 @@ def validate_token(headers: Any) -> Tuple[bool, str]:
         token = headers.get("X-Auth-Token")
         if token in sessions:
             session = sessions[token]
-            if time.time() - session["created"] < 3600:
+            if time.time() - session["created"] < SESSION_TTL_SECONDS:
                 return True, session["username"]
             else:
                 del sessions[token]
@@ -1153,7 +969,7 @@ def get_storage_detail(
 
         # Get disk drives from config
         drives = []
-        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+        for dev_type, dev_count in DISK_DEVICE_RANGES:
             for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
@@ -1224,7 +1040,7 @@ def get_volume_collection(
 
         # Get volumes from config
         volumes = []
-        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+        for dev_type, dev_count in DISK_DEVICE_RANGES:
             for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
@@ -1259,7 +1075,7 @@ def get_controller_collection(
 
         # Get controllers from config
         controllers = []
-        for dev_type, dev_count in [("scsi", 31), ("sata", 6), ("ide", 4), ("virtio", 16)]:
+        for dev_type, dev_count in DISK_DEVICE_RANGES:
             for i in range(dev_count):
                 dev_key = f"{dev_type}{i}"
                 if dev_key in config:
@@ -1289,9 +1105,8 @@ def get_ethernet_interface_collection(
                 "Ethernet interface collection retrieval", Exception("Failed to retrieve VM configuration"), vm_id
             )
 
-        # Get network interfaces from config (Proxmox supports net0-net31)
         interfaces = []
-        for i in range(32):
+        for i in range(NET_DEVICE_COUNT):
             net_key = f"net{i}"
             if net_key in config:
                 interfaces.append({"@odata.id": f"/redfish/v1/Systems/{vm_id}/EthernetInterfaces/{net_key}"})
@@ -1486,697 +1301,10 @@ def get_vm_status(proxmox: ProxmoxAPI, vm_id: int) -> Union[Dict[str, Any], Tupl
         return handle_proxmox_error("VM status retrieval", e, vm_id)
 
 
-# Custom request handler
-class RedfishRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        # Log request details
-        headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
-        logger.debug(f"GET Request: path={self.path}, headers=\n{headers_str}")
-
-        path = self.path.rstrip("/")
-        response: Union[Dict[str, Any], Tuple[Dict[str, Any], int]] = {}
-        status_code = 200
-        self.protocol_version = "HTTP/1.1"
-
-        # Allow root endpoint without authentication for service discovery
-        if path == "/redfish/v1":
-            response = {
-                "@odata.id": "/redfish/v1",
-                "@odata.type": "#ServiceRoot.v1_0_0.ServiceRoot",
-                "Id": "RootService",
-                "Name": "Redfish Root Service",
-                "RedfishVersion": "1.0.0",
-                "Systems": {"@odata.id": "/redfish/v1/Systems"},
-            }
-        else:
-            # Require authentication for all other endpoints
-            valid, message = validate_token(self.headers)
-            if not valid:
-                status_code = 401
-                response = {"error": {"code": "Base.1.0.GeneralError", "message": message}}
-            else:
-                proxmox = get_proxmox_api(self.headers)
-                parts = path.split("/")
-                if path == "/redfish/v1/Systems":
-                    try:
-                        vm_list = _list_cluster_vm_resources(proxmox)
-                        members = [{"@odata.id": f"/redfish/v1/Systems/{vm['vmid']}"} for vm in vm_list]
-                        response = {
-                            "@odata.id": "/redfish/v1/Systems",
-                            "@odata.type": "#SystemCollection.SystemCollection",
-                            "Name": "Systems Collection",
-                            "Members": members,
-                            "Members@odata.count": len(members),
-                        }
-                    except Exception as e:
-                        status_code = 500
-                        response = {
-                            "error": {
-                                "code": "Base.1.0.GeneralError",
-                                "message": f"Failed to retrieve VM list: {str(e)}",
-                            }
-                        }
-                elif path.startswith("/redfish/v1/Systems/"):
-                    if len(parts) == 5 and parts[4].isdigit():  # /redfish/v1/Systems/<vm_id>
-                        vm_id = int(parts[4])
-                        response = get_vm_status(proxmox, vm_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    # START NEW CODE: Handle /redfish/v1/Systems/<vm_id>/Bios
-                    elif len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
-                        vm_id = int(parts[4])
-                        response = get_bios(proxmox, vm_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    # END NEW CODE
-                    elif len(parts) == 6 and parts[5] == "Processors":  # /redfish/v1/Systems/<vm_id>/Processors
-                        vm_id = int(parts[4])
-                        response = get_processor_collection(proxmox, vm_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 7 and parts[5] == "Processors"
-                    ):  # /redfish/v1/Systems/<vm_id>/Processors/<processor_id>
-                        vm_id = int(parts[4])
-                        processor_id = parts[6]
-                        response = get_processor_detail(proxmox, vm_id, processor_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif len(parts) == 6 and parts[5] == "Storage":  # /redfish/v1/Systems/<vm_id>/Storage
-                        vm_id = int(parts[4])
-                        response = get_storage_collection(proxmox, vm_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 7 and parts[5] == "Storage" and parts[6].isdigit()
-                    ):  # /redfish/v1/Systems/<vm_id>/Storage/<storage_id>
-                        vm_id = int(parts[4])
-                        storage_id = parts[6]
-                        response = get_storage_detail(proxmox, vm_id, storage_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 9 and parts[5] == "Storage" and parts[7] == "Drives"
-                    ):  # /redfish/v1/Systems/<vm_id>/Storage/<storage_id>/Drives/<drive_id>
-                        vm_id = int(parts[4])
-                        storage_id = parts[6]
-                        drive_id = parts[8]
-                        response = get_drive_detail(proxmox, vm_id, storage_id, drive_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 8 and parts[5] == "Storage" and parts[7] == "Volumes"
-                    ):  # /redfish/v1/Systems/<vm_id>/Storage/<storage_id>/Volumes
-                        vm_id = int(parts[4])
-                        storage_id = parts[6]
-                        response = get_volume_collection(proxmox, vm_id, storage_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 8 and parts[5] == "Storage" and parts[7] == "Controllers"
-                    ):  # /redfish/v1/Systems/<vm_id>/Storage/<storage_id>/Controllers
-                        vm_id = int(parts[4])
-                        storage_id = parts[6]
-                        response = get_controller_collection(proxmox, vm_id, storage_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 6 and parts[5] == "EthernetInterfaces"
-                    ):  # /redfish/v1/Systems/<vm_id>/EthernetInterfaces
-                        vm_id = int(parts[4])
-                        response = get_ethernet_interface_collection(proxmox, vm_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    elif (
-                        len(parts) == 7 and parts[5] == "EthernetInterfaces"
-                    ):  # /redfish/v1/Systems/<vm_id>/EthernetInterfaces/<interface_id>
-                        vm_id = int(parts[4])
-                        interface_id = parts[6]
-                        response = get_ethernet_interface_detail(proxmox, vm_id, interface_id)
-                        if isinstance(response, tuple):
-                            response, status_code = response
-                    else:
-                        status_code = 404
-                        response = {
-                            "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}
-                        }
-                # --- New: Managers endpoints (Metal3/Ironic path) -----------------
-                elif path.startswith("/redfish/v1/Managers/") and len(parts) == 5 and parts[4].isdigit():
-                    # /redfish/v1/Managers/<manager_id> - Manager detail
-                    manager_id = parts[4]  # string
-                    vm_id = int(manager_id)
-                    response = get_manager(proxmox, vm_id)
-                    if isinstance(response, tuple):
-                        response, status_code = response
-                elif path.startswith("/redfish/v1/Managers/") and len(parts) == 6 and parts[5] == "VirtualMedia":
-                    # /redfish/v1/Managers/1/VirtualMedia - VirtualMedia collection
-                    manager_id = parts[4]  # string
-                    vm_id = int(manager_id)
-                    response = {
-                        "@odata.id": f"/redfish/v1/Managers/{manager_id}/VirtualMedia",
-                        "@odata.type": "#VirtualMediaCollection.VirtualMediaCollection",
-                        "Name": "Virtual Media Collection",
-                        "Members": [{"@odata.id": f"/redfish/v1/Managers/{manager_id}/VirtualMedia/Cd"}],
-                        "Members@odata.count": 1,
-                    }
-                elif (
-                    path.startswith("/redfish/v1/Managers/")
-                    and len(parts) == 7
-                    and parts[5] == "VirtualMedia"
-                    and parts[6] == "Cd"
-                ):
-                    manager_id = parts[4]  # string
-                    vm_id = int(manager_id)
-                    response = get_virtual_media(proxmox, vm_id)
-                    if isinstance(response, tuple):
-                        response, status_code = response
-                else:
-                    status_code = 404
-                    response = {"error": {"code": "Base.1.0.GeneralError", "message": f"Resource not found: {path}"}}
-
-        response_body = json.dumps(response).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response_body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(response_body)
-        logger.debug(f"GET Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
-
-    def do_POST(self) -> None:
-        # Log request details
-        content_length = int(self.headers.get("Content-Length", 0))
-        post_data = self.rfile.read(content_length) if content_length > 0 else b"{}"
-
-        try:
-            post_data_str = post_data.decode("utf-8")
-            try:
-                payload = json.loads(post_data_str)
-            except json.JSONDecodeError:
-                payload = post_data_str  # Log raw string if not JSON
-        except UnicodeDecodeError:
-            post_data_str = "<Non-UTF-8 data>"
-            payload = post_data_str
-        headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
-        logger.debug(
-            f"POST Request: path={self.path}\nHeaders:\n{headers_str}\nPayload:\n{json.dumps(payload, indent=2)}"
-        )
-
-        path = self.path
-        response: Union[Dict[str, Any], Tuple[Dict[str, Any], int]] = {}
-        token = None
-        status_code = 200
-        self.protocol_version = "HTTP/1.1"
-
-        if path == "/redfish/v1/SessionService/Sessions" and AUTH == "Session":
-            try:
-                data = json.loads(post_data.decode("utf-8"))
-                username = data.get("UserName")
-                password = data.get("Password")
-                if not username or not password:
-                    status_code = 400
-                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Missing credentials"}}
-                else:
-                    if "@" not in username:
-                        username += "@pam"
-                    hosts = [entry.strip() for entry in PROXMOX_HOST.split(",") if entry.strip()]
-                    proxmox = None
-                    for host in hosts:
-                        try:
-                            proxmox = ProxmoxAPI(host, user=username, password=password, verify_ssl=VERIFY_SSL)
-                            proxmox.version.get()
-                            break
-                        except Exception:
-                            proxmox = None
-                    if proxmox is None:
-                        raise Exception("Failed to establish a Proxmox session on any configured host")
-                    token = secrets.token_hex(16)
-                    sessions[token] = {"username": username, "password": password, "created": time.time()}
-                    status_code = 201
-                    response = {
-                        "@odata.id": f"/redfish/v1/SessionService/Sessions/{token}",
-                        "Id": token,
-                        "UserName": username,
-                    }
-            except Exception as e:
-                status_code = 401
-                response = {"error": {"code": "Base.1.0.GeneralError", "message": f"Authentication failed: {str(e)}"}}
-        else:
-            valid, message = validate_token(self.headers)
-            if not valid:
-                status_code = 401
-                response = {"error": {"code": "Base.1.0.GeneralError", "message": message}}
-            else:
-                # Get the authenticated username
-                auth_header = self.headers.get("Authorization")
-                if auth_header and auth_header.startswith("Basic "):
-                    credentials = base64.b64decode(auth_header.split(" ")[1]).decode("utf-8")
-                    username, password = credentials.split(":", 1)
-                    if "@" not in username:
-                        username += "@pam"
-                else:
-                    # For session auth, get username from token
-                    token = self.headers.get("X-Auth-Token")
-                    if token in sessions:
-                        username = sessions[token]["username"]
-                    else:
-                        username = "unknown"
-
-                proxmox = get_proxmox_api(self.headers)
-
-                # Handle payload parsing based on endpoint
-                if post_data:
-                    try:
-                        data = json.loads(post_data.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        status_code = 400
-                        response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
-                        response_body = json.dumps(response).encode("utf-8")
-                        self.send_response(status_code)
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(response_body)))
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        self.wfile.write(response_body)
-                        # Log response
-                        logger.debug(
-                            f"POST Response: path={self.path}, status={status_code}, body={json.dumps(response)}"
-                        )
-                        return
-
-                    data = json.loads(post_data.decode("utf-8"))
-                    if path.startswith("/redfish/v1/Systems/") and "/Actions/ComputerSystem.Reset" in path:
-                        vm_id = int(path.split("/")[4])
-
-                        # Check user permissions for this VM
-                        logger.info(f"Temporarily bypassing permission check for user {username} on VM {vm_id}")
-                        # if not check_user_vm_permission(proxmox, username, vm_id):
-                        #     status_code = 403
-                        #     response = {
-                        #         "error": {
-                        #             "code": "Base.1.0.InsufficientPrivilege",
-                        #             "message": f"User {username} does not have permission to access VM {vm_id}"
-                        #         }
-                        #     }
-                        # else:
-                        reset_type = data.get("ResetType", "")
-                        if reset_type == "On":
-                            response, status_code = power_on(proxmox, vm_id)
-                        elif reset_type == "GracefulShutdown":
-                            response, status_code = power_off(proxmox, vm_id)
-                        elif reset_type == "ForceOff":
-                            response, status_code = stop_vm(proxmox, vm_id)
-                        elif reset_type == "GracefulRestart":
-                            response, status_code = reboot(proxmox, vm_id)
-                        elif reset_type == "ForceRestart":
-                            response, status_code = reset_vm(proxmox, vm_id)
-                        elif reset_type == "Pause":
-                            response, status_code = suspend_vm(proxmox, vm_id)
-                        elif reset_type == "Resume":
-                            response, status_code = resume_vm(proxmox, vm_id)
-                        else:
-                            status_code = 400
-                            response = {
-                                "error": {
-                                    "code": "Base.1.0.InvalidRequest",
-                                    "message": f"Unsupported ResetType: {reset_type}",
-                                    "@Message.ExtendedInfo": [
-                                        {
-                                            "MessageId": "Base.1.0.PropertyValueNotInList",
-                                            "Message": f"The value '{reset_type}' for ResetType is not in the supported list: On, GracefulShutdown, ForceOff, GracefulRestart, ForceRestart, Pause, Resume.",
-                                            "MessageArgs": [reset_type],
-                                            "Severity": "Warning",
-                                            "Resolution": "Select a supported ResetType value.",
-                                        }
-                                    ],
-                                }
-                            }
-                    elif (
-                        path.startswith("/redfish/v1/Systems/")
-                        and "/VirtualMedia/CDROM/Actions/VirtualMedia.InsertMedia" in path
-                    ):
-                        vm_id = int(path.split("/")[4])
-                        iso_path = data.get("Image")
-                        response, status_code = manage_virtual_media(proxmox, vm_id, "InsertMedia", iso_path)
-                    elif (
-                        path.startswith("/redfish/v1/Systems/")
-                        and "/VirtualMedia/CDROM/Actions/VirtualMedia.EjectMedia" in path
-                    ):
-                        vm_id = int(path.split("/")[4])
-                        response, status_code = manage_virtual_media(proxmox, vm_id, "EjectMedia")
-                    # --- New: Managers/…/VirtualMedia (sushy default path) -----------------
-                    elif (
-                        path.startswith("/redfish/v1/Managers/")
-                        and "/VirtualMedia/Cd/Actions/VirtualMedia.InsertMedia" in path
-                    ):
-                        manager_id = path.split("/")[4]  # usually "1"
-                        iso_path = data.get("Image")
-                        # map Manager-ID → VM-ID  (here we treat them as identical)
-                        vm_id = int(manager_id)
-                        response, status_code = manage_virtual_media(proxmox, vm_id, "InsertMedia", iso_path)
-
-                    elif (
-                        path.startswith("/redfish/v1/Managers/")
-                        and "/VirtualMedia/Cd/Actions/VirtualMedia.EjectMedia" in path
-                    ):
-                        manager_id = path.split("/")[4]
-                        vm_id = int(manager_id)
-                        response, status_code = manage_virtual_media(proxmox, vm_id, "EjectMedia")
-                    elif path.startswith("/redfish/v1/Systems/") and "/Actions/ComputerSystem.UpdateConfig" in path:
-                        vm_id = int(path.split("/")[4])
-                        config_data = data
-                        response, status_code = update_vm_config(proxmox, vm_id, config_data)
-                    else:
-                        status_code = 404
-                        response = {
-                            "error": {"code": "Base.1.0.GeneralError", "message": f"Resource not found: {path}"}
-                        }
-
-        # Convert response to JSON and calculate its length
-        response_body = json.dumps(response).encode("utf-8")
-        content_length = len(response_body)
-
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(content_length))
-        if token and path == "/redfish/v1/SessionService/Sessions":
-            self.send_header("X-Auth-Token", token)
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(json.dumps(response).encode("utf-8"))
-
-        # Log response
-        logger.debug(f"POST Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
-
-    def do_PATCH(self) -> None:
-        # Log request details
-        content_length = int(self.headers.get("Content-Length", 0))
-        post_data = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        try:
-            post_data_str = post_data.decode("utf-8")
-            try:
-                payload = json.loads(post_data_str)
-            except json.JSONDecodeError:
-                payload = post_data_str  # Log raw string if not JSON
-        except UnicodeDecodeError:
-            post_data_str = "<Non-UTF-8 data>"
-            payload = post_data_str
-        headers_str = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
-        logger.debug(
-            f"PATCH Request: path={self.path}\nHeaders:\n{headers_str}\nPayload:\n{json.dumps(payload, indent=2)}"
-        )
-
-        path = self.path.rstrip("/")
-        parts = path.split("/")
-        response: Union[Dict[str, Any], Tuple[Dict[str, Any], int]] = {}
-        status_code = 200
-        self.protocol_version = "HTTP/1.1"
-
-        logger.debug(f"Processing PATCH request for path: {path}")
-
-        valid, message = validate_token(self.headers)
-        if not valid:
-            logger.error(f"Authentication failed: {message}")
-            status_code = 401
-            response = {"error": {"code": "Base.1.0.GeneralError", "message": message}}
-        else:
-            try:
-                proxmox = get_proxmox_api(self.headers)
-                logger.debug("Proxmox API connection established for VM operation")
-            except Exception as e:
-                logger.error(f"Failed to get Proxmox API: {str(e)}")
-                status_code = 500
-                response = {
-                    "error": {"code": "Base.1.0.GeneralError", "message": f"Failed to connect to Proxmox API: {str(e)}"}
-                }
-                response_body = json.dumps(response).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(response_body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(response_body)
-                logger.debug(f"PATCH Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
-                return
-
-            if len(parts) == 6 and parts[5] == "Bios":  # /redfish/v1/Systems/<vm_id>/Bios
-                vm_id = parts[4]
-                try:
-                    data = json.loads(post_data.decode("utf-8"))
-                    if "Attributes" in data:
-                        attributes = data["Attributes"]
-                        if "FirmwareMode" in attributes:
-                            mode = attributes["FirmwareMode"]
-                            if mode not in ["BIOS", "UEFI"]:
-                                status_code = 400
-                                response = {
-                                    "error": {
-                                        "code": "Base.1.0.PropertyValueNotInList",
-                                        "message": f"Invalid FirmwareMode: {mode}",
-                                    }
-                                }
-                            else:
-                                bios_setting = "seabios" if mode == "BIOS" else "ovmf"
-                                task = _get_vm_resource(proxmox, vm_id).config.set(bios=bios_setting)
-                                response = {
-                                    "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
-                                    "@odata.type": "#Task.v1_0_0.Task",
-                                    "Id": task,
-                                    "Name": f"Set BIOS Mode for VM {vm_id}",
-                                    "TaskState": "Running",
-                                    "TaskStatus": "OK",
-                                    "Messages": [{"Message": f"Set BIOS mode to {mode} for VM {vm_id}"}],
-                                }
-                                status_code = 202
-                        else:
-                            status_code = 400
-                            response = {
-                                "error": {
-                                    "code": "Base.1.0.PropertyUnknown",
-                                    "message": "No supported attributes provided",
-                                }
-                            }
-                    else:
-                        status_code = 400
-                        response = {
-                            "error": {
-                                "code": "Base.1.0.InvalidRequest",
-                                "message": "Attributes object required in PATCH request",
-                            }
-                        }
-                except json.JSONDecodeError:
-                    status_code = 400
-                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
-                except Exception as e:
-                    response, status_code = handle_proxmox_error("BIOS update", e, vm_id)
-            elif path.startswith("/redfish/v1/Systems/") and len(parts) == 5:
-                vm_id = path.split("/")[4]
-                logger.debug(f"Processing boot configuration for VM {vm_id}")
-                try:
-                    data = json.loads(post_data.decode("utf-8"))
-                    logger.debug(f"Parsed payload: {json.dumps(data, indent=2)}")
-                    # START NEW CODE: Handle sushy ironic drive's incorrect BootSourceOverrideMode request
-                    if "Boot" in data and "BootSourceOverrideMode" in data["Boot"]:
-                        logger.warning(
-                            f"Received non-standard BootSourceOverrideMode request at /redfish/v1/Systems/{vm_id}; redirecting to BIOS handling"
-                        )
-                        mode = data["Boot"]["BootSourceOverrideMode"]
-                        # Map BootSourceOverrideMode to FirmwareMode
-                        mode_map = {"UEFI": "UEFI", "Legacy": "BIOS"}
-                        if mode not in mode_map:
-                            status_code = 400
-                            response = {
-                                "error": {
-                                    "code": "Base.1.0.PropertyValueNotInList",
-                                    "message": f"Invalid BootSourceOverrideMode: {mode}",
-                                }
-                            }
-                        else:
-                            firmware_mode = mode_map[mode]
-                            bios_setting = "seabios" if firmware_mode == "BIOS" else "ovmf"
-                            task = _get_vm_resource(proxmox, vm_id).config.set(bios=bios_setting)
-                            response = {
-                                "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
-                                "@odata.type": "#Task.v1_0_0.Task",
-                                "Id": task,
-                                "Name": f"Set BIOS Mode for VM {vm_id}",
-                                "TaskState": "Completed",  # Changed from "Running" to indicate immediate completion
-                                "TaskStatus": "OK",
-                                "Messages": [{"Message": f"Set BIOS mode to {firmware_mode} for VM {vm_id}"}],
-                            }
-                            status_code = 200  # Changed from 202 to 200 for sushi driver
-                            response_body = json.dumps(response).encode("utf-8")
-                            self.send_response(status_code)
-                            self.send_header("Content-Type", "application/json")
-                            self.send_header("Content-Length", str(len(response_body)))
-                            self.send_header("Connection", "close")
-                            self.end_headers()
-                            self.wfile.write(response_body)
-                            logger.debug(
-                                f"PATCH Response: path={self.path}, status={status_code}, body={json.dumps(response)}"
-                            )
-                            return
-                    # END NEW CODE
-                    if "Boot" in data:
-                        boot_data = data["Boot"]
-                        if "BootSourceOverrideMode" in boot_data:
-                            status_code = 400
-                            response = {
-                                "error": {
-                                    "code": "Base.1.0.ActionNotSupported",
-                                    "message": "Changing BootSourceOverrideMode is not supported through this resource. Use the Bios resource to change the boot mode.",
-                                    "@Message.ExtendedInfo": [
-                                        {
-                                            "MessageId": "Base.1.0.ActionNotSupported",
-                                            "Message": "The property BootSourceOverrideMode cannot be changed through the ComputerSystem resource. To change the boot mode, use a PATCH request to the Bios resource.",
-                                            "Severity": "Warning",
-                                            "Resolution": "Send a PATCH request to /redfish/v1/Systems/<vm_id>/Bios with the desired FirmwareMode in Attributes.",
-                                        }
-                                    ],
-                                }
-                            }
-                        else:
-                            target = boot_data.get("BootSourceOverrideTarget")
-                            enabled = boot_data.get("BootSourceOverrideEnabled", "Once")
-                            logger.debug(f"Boot parameters: target={target}, enabled={enabled}")
-
-                            if target not in ["Pxe", "Cd", "Hdd"]:
-                                logger.error(f"Invalid BootSourceOverrideTarget: {target}")
-                                status_code = 400
-                                response = {
-                                    "error": {
-                                        "code": "Base.1.0.InvalidRequest",
-                                        "message": f"Unsupported BootSourceOverrideTarget: {target}",
-                                        "@Message.ExtendedInfo": [
-                                            {
-                                                "MessageId": "Base.1.0.PropertyValueNotInList",
-                                                "Message": f"The value '{target}' for BootSourceOverrideTarget is not in the supported list: Pxe, Cd, Hdd.",
-                                                "MessageArgs": [target],
-                                                "Severity": "Warning",
-                                                "Resolution": "Select a supported boot device from BootSourceOverrideSupported.",
-                                            }
-                                        ],
-                                    }
-                                }
-                            elif enabled not in ["Once", "Continuous", "Disabled"]:
-                                logger.error(f"Invalid BootSourceOverrideEnabled: {enabled}")
-                                status_code = 400
-                                response = {
-                                    "error": {
-                                        "code": "Base.1.0.InvalidRequest",
-                                        "message": f"Unsupported BootSourceOverrideEnabled: {enabled}",
-                                        "@Message.ExtendedInfo": [
-                                            {
-                                                "MessageId": "Base.1.0.PropertyValueNotInList",
-                                                "Message": f"The value '{enabled}' for BootSourceOverrideEnabled is not in the supported list: Once, Continuous, Disabled.",
-                                                "MessageArgs": [enabled],
-                                                "Severity": "Warning",
-                                                "Resolution": "Select a supported value for BootSourceOverrideEnabled.",
-                                            }
-                                        ],
-                                    }
-                                }
-                            # Check the VM's current power state
-                            logger.debug(f"Checking power state for VM {vm_id}")
-                            try:
-                                vm_resource = _get_vm_resource(proxmox, vm_id)
-                                status = vm_resource.status.current.get()
-                                logger.debug(f"VM {vm_id} status: {status['status']}")
-                            except Exception as e:
-                                logger.error(f"Failed to get VM {vm_id} status: {str(e)}")
-                                status_code = 500
-                                response = {
-                                    "error": {
-                                        "code": "Base.1.0.GeneralError",
-                                        "message": f"Failed to get VM status: {str(e)}",
-                                    }
-                                }
-
-                            redfish_status = {
-                                "running": "On",
-                                "stopped": "Off",
-                                "paused": "Paused",
-                                "shutdown": "Off",
-                            }.get(status["status"], "Unknown")
-                            logger.debug(f"VM {vm_id} redfish_status: {redfish_status}")
-
-                            # Proceed with boot order change
-                            logger.debug(f"VM {vm_id}, proceeding with boot order change to {target}")
-                            try:
-                                config = vm_resource.config.get()
-                                current_boot = config.get("boot", "")
-                                logger.debug(f"Current boot order: {current_boot}")
-                                new_boot_order = reorder_boot_order(proxmox, int(vm_id), current_boot, target)
-                                logger.debug(f"New boot order: {new_boot_order}")
-                                config_data = {"boot": f"order={new_boot_order}" if new_boot_order else ""}
-                                task = vm_resource.config.post(**config_data)
-                                logger.debug(f"Boot order update task initiated: {task}")
-                                response = {
-                                    "@odata.id": f"/redfish/v1/TaskService/Tasks/{task}",
-                                    "@odata.type": "#Task.v1_0_0.Task",
-                                    "Id": task,
-                                    "Name": f"Set Boot Order for VM {vm_id}",
-                                    "TaskState": "Running",
-                                    "TaskStatus": "OK",
-                                    "Messages": [
-                                        {"Message": f"Boot order set to {target} ({new_boot_order}) for VM {vm_id}"}
-                                    ],
-                                }
-                                status_code = 202
-                            except ValueError as e:
-                                logger.error(f"Failed to set boot order for VM {vm_id}: {str(e)}")
-                                status_code = 400
-                                response = {
-                                    "error": {
-                                        "code": "Base.1.0.ActionNotSupported",
-                                        "message": f"Cannot set BootSourceOverrideTarget to {target}: {str(e)}",
-                                        "@Message.ExtendedInfo": [
-                                            {
-                                                "MessageId": "Base.1.0.ActionNotSupported",
-                                                "Message": f"The requested boot device '{target}' is not available. Available boot devices are: Pxe, Cd.",
-                                                "MessageArgs": [target],
-                                                "Severity": "Warning",
-                                                "Resolution": "Select a supported boot device from BootSourceOverrideSupported or verify the VM configuration.",
-                                            }
-                                        ],
-                                    }
-                                }
-                            except Exception as e:
-                                logger.error(f"Failed to set boot order for VM {vm_id}: {str(e)}")
-                                response, status_code = handle_proxmox_error("Boot configuration", e, vm_id)
-                    else:
-                        logger.error("Boot object required in PATCH request")
-                        status_code = 400
-                        response = {
-                            "error": {
-                                "code": "Base.1.0.InvalidRequest",
-                                "message": "Boot object required in PATCH request",
-                            }
-                        }
-                except json.JSONDecodeError:
-                    logger.error("Invalid JSON payload")
-                    status_code = 400
-                    response = {"error": {"code": "Base.1.0.GeneralError", "message": "Invalid JSON payload"}}
-            else:
-                logger.error(f"Resource not found: {path}")
-                status_code = 404
-                response = {
-                    "error": {"code": "Base.1.0.ResourceMissingAtURI", "message": f"Resource not found: {path}"}
-                }
-
-        response_body = json.dumps(response).encode("utf-8")
-        content_length = len(response_body)
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(response_body)
-
-        logger.debug(f"PATCH Response: path={self.path}, status={status_code}, body={json.dumps(response)}")
+from proxmox_redfish.handler import RedfishRequestHandler  # noqa: E402
 
 
-# Server function (unchanged)
+# Server function
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     server_address = (host, port)
     httpd = socketserver.TCPServer(server_address, RedfishRequestHandler)
