@@ -605,8 +605,8 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.headers = {"X-Auth-Token": self.test_token}
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
         ) as mock_get_api:
 
             mock_validate.return_value = (True, self.test_username)
@@ -628,8 +628,8 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.headers = {"X-Auth-Token": self.test_token}
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
         ) as mock_get_api:
 
             mock_validate.return_value = (True, self.test_username)
@@ -656,9 +656,9 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.headers = {"X-Auth-Token": self.test_token}
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
-        ) as mock_get_api, patch("proxmox_redfish.handler.get_vm_status") as mock_get_status:
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
+        ) as mock_get_api, patch("proxmox_redfish.proxmox_redfish.get_vm_status") as mock_get_status:
 
             mock_validate.return_value = (True, self.test_username)
             mock_proxmox = Mock()
@@ -690,9 +690,9 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.rfile = BytesIO(body)
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
-        ) as mock_get_api, patch("proxmox_redfish.handler.power_on") as mock_power_on:
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
+        ) as mock_get_api, patch("proxmox_redfish.proxmox_redfish.power_on") as mock_power_on:
 
             mock_validate.return_value = (True, self.test_username)
             mock_proxmox = Mock()
@@ -716,9 +716,9 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.rfile = BytesIO(body)
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
-        ) as mock_get_api, patch("proxmox_redfish.handler.manage_virtual_media") as mock_manage:
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
+        ) as mock_get_api, patch("proxmox_redfish.proxmox_redfish.manage_virtual_media") as mock_manage:
 
             mock_validate.return_value = (True, self.test_username)
             mock_proxmox = Mock()
@@ -740,9 +740,9 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.rfile = BytesIO(b"{}")
 
         # Mock authentication and Proxmox API
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate, patch(
-            "proxmox_redfish.handler.get_proxmox_api"
-        ) as mock_get_api, patch("proxmox_redfish.handler.manage_virtual_media") as mock_manage:
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate, patch(
+            "proxmox_redfish.proxmox_redfish.get_proxmox_api"
+        ) as mock_get_api, patch("proxmox_redfish.proxmox_redfish.manage_virtual_media") as mock_manage:
 
             mock_validate.return_value = (True, self.test_username)
             mock_proxmox = Mock()
@@ -762,7 +762,7 @@ class TestRedfishEndpoints(unittest.TestCase):
         handler.path = "/redfish/v1/Systems"
         handler.headers = {"X-Auth-Token": "invalid-token"}
 
-        with patch("proxmox_redfish.handler.validate_token") as mock_validate:
+        with patch("proxmox_redfish.proxmox_redfish.validate_token") as mock_validate:
             mock_validate.return_value = (False, "Invalid token")
 
             handler.do_GET()
